@@ -47,10 +47,11 @@ data:
 
     # Step 2: MinIO bucket backup (mc was placed by init container)
     echo "[backup] Backing up MinIO attachment bucket..."
-    if [ -x /usr/local/bin/mc ]; then
-      mc alias set glitchtip-store http://glitchtip-minio:9000 "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 2>/dev/null
-      mc mirror glitchtip-store/glitchtip-attachments "${BACKUP_DIR}/minio-attachments/" 2>&1
-      MINIO_OBJECTS=$(mc ls --recursive glitchtip-store/glitchtip-attachments/ 2>/dev/null | wc -l)
+    MC_BIN=$(which mc 2>/dev/null || echo "/tmp/mc")
+    if [ -x "${MC_BIN}" ]; then
+      "${MC_BIN}" alias set glitchtip-store http://glitchtip-minio:9000 "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 2>/dev/null
+      "${MC_BIN}" mirror glitchtip-store/glitchtip-attachments "${BACKUP_DIR}/minio-attachments/" 2>&1
+      MINIO_OBJECTS=$("${MC_BIN}" ls --recursive glitchtip-store/glitchtip-attachments/ 2>/dev/null | wc -l)
       echo "[backup] MinIO backup complete: ${MINIO_OBJECTS} objects."
     else
       echo "[backup] WARNING: mc not available, skipping MinIO backup"
@@ -137,7 +138,7 @@ spec:
             command:
             - /bin/bash
             - -c
-            - "cp /mc-bin/mc /usr/local/bin/mc 2>/dev/null; chmod +x /usr/local/bin/mc 2>/dev/null; /scripts/backup.sh"
+            - "cp /mc-bin/mc /tmp/mc 2>/dev/null; chmod +x /tmp/mc 2>/dev/null; export PATH=/tmp:$PATH; bash /scripts/backup.sh"
             volumeMounts:
             - name: backup-script
               mountPath: /scripts
