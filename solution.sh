@@ -9,21 +9,13 @@ echo "[solution] Current backup only does pg_dump — no MinIO backup."
 
 MINIO_ACCESS=$(kubectl get secret glitchtip-minio-creds -n glitchtip -o jsonpath='{.data.MINIO_ACCESS_KEY}' | base64 -d)
 MINIO_SECRET=$(kubectl get secret glitchtip-minio-creds -n glitchtip -o jsonpath='{.data.MINIO_SECRET_KEY}' | base64 -d)
-MINIO_BUCKET="glitchtip-attachments"
 
 echo "[solution] Step 1b: Fixing MinIO access for backup pods..."
-
-# Fix the NetworkPolicy — add minio-access label to backup pods OR delete the restrictive policy
 kubectl delete networkpolicy glitchtip-minio-access-policy -n glitchtip 2>/dev/null || true
 echo "[solution] MinIO NetworkPolicy removed."
 
-# Note: glitchtip-minio-creds has CORRECT creds, glitchtip-backup-minio-creds has WRONG creds
-# Solution uses the correct secret
+echo "[solution] Step 2: Updating backup ConfigMap with MinIO + validation..."
 
-echo "[solution] Step 2: Updating backup script to include MinIO + validation..."
-
-# Update the ConfigMap with the fixed backup script
-# Uses pg_dump for PostgreSQL AND mc for MinIO (mc available via init container shared volume)
 kubectl apply -f - <<'SCRIPT_EOF'
 apiVersion: v1
 kind: ConfigMap
@@ -32,62 +24,45 @@ metadata:
   namespace: glitchtip
 data:
   backup.sh: |
-    #!/bin/bash
+    #!/bin/sh
     set -e
-    echo "[backup] Starting GlitchTip backup..."
-    TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-    BACKUP_DIR="/backups/glitchtip-${TIMESTAMP}"
-    mkdir -p "${BACKUP_DIR}"
+    echo "[backup] Starting GlitchTip MinIO backup..."
 
-    # Step 1: PostgreSQL dump
-    echo "[backup] Dumping PostgreSQL database..."
-    PGPASSWORD="${PGPASSWORD}" pg_dump -h glitchtip-postgresql -U postgres -d postgres \
-      --format=custom --file="${BACKUP_DIR}/glitchtip_db.dump"
-    echo "[backup] PostgreSQL dump complete."
-
-    # Step 2: MinIO bucket backup (mc was placed by init container)
-    echo "[backup] Backing up MinIO attachment bucket..."
-    MC_BIN=$(which mc 2>/dev/null || echo "/tmp/mc")
-    if [ -x "${MC_BIN}" ]; then
-      "${MC_BIN}" alias set glitchtip-store http://glitchtip-minio:9000 "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 2>/dev/null
-      "${MC_BIN}" mirror glitchtip-store/glitchtip-attachments "${BACKUP_DIR}/minio-attachments/" 2>&1
-      MINIO_OBJECTS=$("${MC_BIN}" ls --recursive glitchtip-store/glitchtip-attachments/ 2>/dev/null | wc -l)
-      echo "[backup] MinIO backup complete: ${MINIO_OBJECTS} objects."
+    # PostgreSQL dump done by init container
+    PG_DUMP=$(find /backups -name "glitchtip_db.dump" 2>/dev/null | head -1)
+    if [ -n "${PG_DUMP}" ]; then
+      echo "[backup] PostgreSQL dump verified: ${PG_DUMP}"
     else
-      echo "[backup] WARNING: mc not available, skipping MinIO backup"
-      MINIO_OBJECTS=0
+      echo "[backup] WARNING: No PostgreSQL dump found"
     fi
 
-    # Step 3: Post-backup validation
+    # MinIO bucket backup
+    echo "[backup] Backing up MinIO attachment bucket..."
+    mc alias set glitchtip-store http://glitchtip-minio:9000 "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 >/dev/null 2>&1
+    mc mirror glitchtip-store/glitchtip-attachments /backups/minio-attachments/ 2>&1
+    MINIO_OBJECTS=$(mc ls --recursive glitchtip-store/glitchtip-attachments/ 2>/dev/null | wc -l)
+    echo "[backup] MinIO backup complete: ${MINIO_OBJECTS} objects mirrored."
+
+    # Validation
     echo "[backup] Running post-backup validation..."
-    PG_COUNT=$(PGPASSWORD="${PGPASSWORD}" psql -h glitchtip-postgresql -U postgres -d postgres -tAc "SELECT COUNT(*) FROM files_fileblob;")
-    BACKUP_FILES=$(find "${BACKUP_DIR}/minio-attachments/" -type f 2>/dev/null | wc -l)
+    BACKUP_FILES=$(find /backups/minio-attachments/ -type f 2>/dev/null | wc -l)
+    echo "[backup] Validation: MinIO objects=${MINIO_OBJECTS}, Backed up=${BACKUP_FILES}"
 
-    echo "[backup] Validation: PG records=${PG_COUNT}, MinIO objects=${MINIO_OBJECTS:-0}, Backed up=${BACKUP_FILES}"
-
-    if [ "${PG_COUNT}" -gt 0 ] && [ "${MINIO_OBJECTS:-0}" -eq 0 ]; then
-      echo "[backup] VALIDATION FAILED: PG has ${PG_COUNT} records but MinIO has 0 objects!"
+    if [ "${MINIO_OBJECTS}" -gt 0 ] && [ "${BACKUP_FILES}" -lt "${MINIO_OBJECTS}" ]; then
+      echo "[backup] VALIDATION FAILED: Only backed up ${BACKUP_FILES} of ${MINIO_OBJECTS} objects!"
       exit 1
     fi
 
-    echo "timestamp=${TIMESTAMP}" > "${BACKUP_DIR}/manifest.txt"
-    echo "pg_dump=success" >> "${BACKUP_DIR}/manifest.txt"
-    echo "minio_backup=success" >> "${BACKUP_DIR}/manifest.txt"
-    echo "minio_objects=${MINIO_OBJECTS:-0}" >> "${BACKUP_DIR}/manifest.txt"
-    echo "pg_records=${PG_COUNT}" >> "${BACKUP_DIR}/manifest.txt"
-    echo "validation=passed" >> "${BACKUP_DIR}/manifest.txt"
-    echo "[backup] Backup and validation complete."
-  mc-install.sh: |
-    #!/bin/sh
-    # Copy mc binary to shared volume for the main backup container
-    cp /usr/bin/mc /shared/mc 2>/dev/null || cp $(which mc) /shared/mc 2>/dev/null || true
-    chmod +x /shared/mc 2>/dev/null || true
-    echo "mc binary copied to shared volume"
+    if [ "${MINIO_OBJECTS}" -eq 0 ]; then
+      echo "[backup] VALIDATION FAILED: MinIO has 0 objects — bucket may be empty or unreachable!"
+      exit 1
+    fi
+
+    echo "[backup] Backup and validation complete. ${MINIO_OBJECTS} objects verified."
 SCRIPT_EOF
 
-echo "[solution] Step 3: Patching CronJob with init container for mc + MinIO env..."
+echo "[solution] Step 3: Updating CronJob with pg17 init + mc main container..."
 
-# Replace the CronJob to add init container (copies mc binary) + MinIO env vars
 kubectl apply -f - <<'CJ_EOF'
 apiVersion: batch/v1
 kind: CronJob
@@ -119,43 +94,38 @@ spec:
               defaultMode: 0755
           - name: backup-storage
             emptyDir: {}
-          - name: mc-binary
-            emptyDir: {}
           initContainers:
-          - name: mc-setup
-            image: docker.io/minio/mc:RELEASE.2024-11-21T17-21-54Z
-            imagePullPolicy: IfNotPresent
-            command: ["/bin/sh", "-c", "cp /usr/bin/mc /shared/mc && chmod +x /shared/mc && echo mc copied"]
-            volumeMounts:
-            - name: mc-binary
-              mountPath: /shared
-          containers:
-          - name: backup
+          - name: pg-dump
             image: docker.io/bitnamilegacy/postgresql:17.0.0-debian-12-r11
             imagePullPolicy: IfNotPresent
             command:
             - /bin/bash
             - -c
             - |
-              cp /mc-bin/mc /tmp/mc 2>/dev/null || true
-              chmod +x /tmp/mc 2>/dev/null || true
-              ln -sf /mc-bin/mc /usr/local/bin/mc 2>/dev/null || ln -sf /tmp/mc /usr/local/bin/mc 2>/dev/null || true
-              export PATH=/mc-bin:/tmp:$PATH
-              echo "mc location: $(which mc 2>/dev/null || echo NOT_FOUND)"
-              bash /scripts/backup.sh
+              echo "[backup] Dumping PostgreSQL database..."
+              PGPASSWORD="${PGPASSWORD}" pg_dump -h glitchtip-postgresql -U postgres -d postgres \
+                --format=custom --file="/backups/glitchtip_db.dump"
+              echo "[backup] PostgreSQL dump complete."
             volumeMounts:
-            - name: backup-script
-              mountPath: /scripts
             - name: backup-storage
               mountPath: /backups
-            - name: mc-binary
-              mountPath: /mc-bin
             env:
             - name: PGPASSWORD
               valueFrom:
                 secretKeyRef:
                   name: glitchtip-postgresql
                   key: postgres-password
+          containers:
+          - name: backup
+            image: docker.io/minio/mc:RELEASE.2024-11-21T17-21-54Z
+            imagePullPolicy: IfNotPresent
+            command: ["/bin/sh", "/scripts/backup.sh"]
+            volumeMounts:
+            - name: backup-script
+              mountPath: /scripts
+            - name: backup-storage
+              mountPath: /backups
+            env:
             - name: MINIO_ACCESS_KEY
               valueFrom:
                 secretKeyRef:
@@ -168,11 +138,9 @@ spec:
                   key: MINIO_SECRET_KEY
 CJ_EOF
 
-echo "[solution] Step 4: Backup CronJob updated. Grader will trigger test run."
-
-echo "[solution] Step 5: Verifying MinIO objects..."
+echo "[solution] Step 4: Verifying MinIO objects..."
 MINIO_POD=$(kubectl get pods -n glitchtip -l app=glitchtip-minio -o jsonpath='{.items[0].metadata.name}')
-OBJ_COUNT=$(kubectl exec -n glitchtip "${MINIO_POD}" -- bash -c "mc alias set local http://localhost:9000 glitchtip-minio minio-secret-key-2024 2>/dev/null; mc ls --recursive local/glitchtip-attachments/ 2>/dev/null | wc -l" || echo "0")
+OBJ_COUNT=$(kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "mc alias set local http://localhost:9000 ${MINIO_ACCESS} ${MINIO_SECRET} >/dev/null 2>&1; mc ls --recursive local/glitchtip-attachments/ 2>/dev/null | wc -l")
 echo "[solution] MinIO objects: ${OBJ_COUNT}"
 
 GT_PG_POD=$(kubectl get pods -n glitchtip -l app.kubernetes.io/name=postgresql -o jsonpath='{.items[0].metadata.name}')
