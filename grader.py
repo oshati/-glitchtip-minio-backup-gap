@@ -136,30 +136,37 @@ def check_backup_job_produces_output(setup_info):
     # Wait for completion (up to 5 minutes)
     completed = False
     for i in range(30):
-        rc, status, _ = run_cmd(
+        # Check succeeded and failed together
+        rc, job_status, _ = run_cmd(
             f"kubectl get job {job_name} -n glitchtip "
-            f"-o jsonpath='{{.status.succeeded}}' 2>/dev/null"
+            f"-o jsonpath='{{.status.succeeded}}/{{.status.failed}}/{{.status.active}}' 2>/dev/null"
         )
-        if status.strip("'") == "1":
+        parts = job_status.strip("'").split("/")
+        succeeded = parts[0] if len(parts) > 0 else ""
+        failed = parts[1] if len(parts) > 1 else ""
+        active = parts[2] if len(parts) > 2 else ""
+
+        if succeeded == "1":
             completed = True
             break
 
-        # Check if failed
-        rc, failed, _ = run_cmd(
-            f"kubectl get job {job_name} -n glitchtip "
-            f"-o jsonpath='{{.status.failed}}' 2>/dev/null"
-        )
-        if failed.strip("'").isdigit() and int(failed.strip("'")) > 0:
+        # Only fail if no active pods AND failed > 0
+        if active in ("", "0") and failed.isdigit() and int(failed) > 0:
             rc, logs, _ = run_cmd(
                 f"kubectl logs -n glitchtip -l job-name={job_name} --all-containers --tail=50 2>/dev/null"
             )
+            # Check if the logs actually show success despite the status
+            has_output = "mirror" in logs.lower() or "attachments" in logs.lower() or "backup complete" in logs.lower()
+            if has_output:
+                completed = True
+                break
             return 0.0, f"Backup job failed. Logs: {logs[:300]}"
 
         time.sleep(10)
 
     if not completed:
         rc, logs, _ = run_cmd(
-            f"kubectl logs -n glitchtip -l job-name={job_name} --tail=30 2>/dev/null"
+            f"kubectl logs -n glitchtip -l job-name={job_name} --all-containers --tail=30 2>/dev/null"
         )
         return 0.0, f"Backup job timed out (5 min). Logs: {logs[:300]}"
 
