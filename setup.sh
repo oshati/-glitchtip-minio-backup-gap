@@ -177,28 +177,30 @@ done
 ###############################################
 echo "[setup] Creating attachment bucket and sample files..."
 
-# Use mc directly on the MinIO pod (minio/minio image includes mc)
-kubectl exec -n glitchtip "${MINIO_POD}" -- bash -c "
-mc alias set local http://localhost:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY} 2>/dev/null
-mc mb local/${MINIO_BUCKET} 2>/dev/null || true
+# Write the MinIO setup script to a file to avoid quoting issues
+cat > /tmp/minio_setup.sh << 'MINIO_SETUP'
+#!/bin/bash
+mc alias set local http://localhost:9000 "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY" >/dev/null 2>&1
+mc mb local/glitchtip-attachments 2>/dev/null || true
 
-# Create 10 sample attachment files
-for i in \$(seq 1 10); do
-  echo \"crash-report-data-for-event-\${i}-stacktrace-binary-blob\" | mc pipe local/${MINIO_BUCKET}/attachments/event_\${i}/crash_report_\${i}.dmp 2>/dev/null
-  echo \"source-map-bundle-for-service-\${i}\" | mc pipe local/${MINIO_BUCKET}/attachments/event_\${i}/sourcemap_\${i}.js.map 2>/dev/null
+for i in $(seq 1 10); do
+  echo "crash-report-data-event-${i}" | mc pipe local/glitchtip-attachments/attachments/event_${i}/crash_report_${i}.dmp 2>/dev/null
+  echo "source-map-service-${i}" | mc pipe local/glitchtip-attachments/attachments/event_${i}/sourcemap_${i}.js.map 2>/dev/null
 done
 
-# Create 5 debug symbol files
-for i in \$(seq 1 5); do
-  echo \"debug-symbol-file-dsym-content-\${i}\" | mc pipe local/${MINIO_BUCKET}/debug-symbols/dsym_\${i}.dSYM 2>/dev/null
+for i in $(seq 1 5); do
+  echo "debug-symbol-dsym-${i}" | mc pipe local/glitchtip-attachments/debug-symbols/dsym_${i}.dSYM 2>/dev/null
 done
 
-echo 'Bucket populated.'
-mc ls --recursive local/${MINIO_BUCKET}/ | wc -l
-" 2>&1 || echo "[setup] MinIO setup had warnings"
+COUNT=$(mc ls --recursive local/glitchtip-attachments/ 2>/dev/null | wc -l)
+echo "OBJECT_COUNT=${COUNT}"
+MINIO_SETUP
 
-# Verify objects were created
-OBJ_COUNT=$(kubectl exec -n glitchtip "${MINIO_POD}" -- bash -c "mc alias set local http://localhost:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY} 2>/dev/null; mc ls --recursive local/${MINIO_BUCKET}/ 2>/dev/null | wc -l")
+kubectl cp /tmp/minio_setup.sh glitchtip/${MINIO_POD}:/tmp/minio_setup.sh
+kubectl exec -n glitchtip "${MINIO_POD}" -- env MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY}" MINIO_SECRET_KEY="${MINIO_SECRET_KEY}" bash /tmp/minio_setup.sh 2>&1
+
+# Verify
+OBJ_COUNT=$(kubectl exec -n glitchtip "${MINIO_POD}" -- bash -c "mc alias set local http://localhost:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY} >/dev/null 2>&1; mc ls --recursive local/${MINIO_BUCKET}/ 2>/dev/null | wc -l")
 echo "[setup] MinIO objects created: ${OBJ_COUNT}"
 
 ###############################################
