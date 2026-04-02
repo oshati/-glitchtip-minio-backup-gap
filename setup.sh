@@ -178,29 +178,27 @@ done
 echo "[setup] Creating attachment bucket and sample files..."
 
 # Write the MinIO setup script to a file to avoid quoting issues
-cat > /tmp/minio_setup.sh << 'MINIO_SETUP'
-#!/bin/bash
-mc alias set local http://localhost:9000 "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY" >/dev/null 2>&1
-mc mb local/glitchtip-attachments 2>/dev/null || true
+# Create objects directly via kubectl exec (no kubectl cp — container lacks tar)
+kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "
+mc alias set local http://localhost:9000 '${MINIO_ACCESS_KEY}' '${MINIO_SECRET_KEY}' >/dev/null 2>&1
+mc mb local/${MINIO_BUCKET} 2>/dev/null || true
+" 2>&1
 
 for i in $(seq 1 10); do
-  echo "crash-report-data-event-${i}" | mc pipe local/glitchtip-attachments/attachments/event_${i}/crash_report_${i}.dmp 2>/dev/null
-  echo "source-map-service-${i}" | mc pipe local/glitchtip-attachments/attachments/event_${i}/sourcemap_${i}.js.map 2>/dev/null
+  kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "
+    echo 'crash-report-data-event-${i}' | mc pipe local/${MINIO_BUCKET}/attachments/event_${i}/crash_report_${i}.dmp 2>/dev/null
+    echo 'source-map-service-${i}' | mc pipe local/${MINIO_BUCKET}/attachments/event_${i}/sourcemap_${i}.js.map 2>/dev/null
+  " 2>/dev/null
 done
 
 for i in $(seq 1 5); do
-  echo "debug-symbol-dsym-${i}" | mc pipe local/glitchtip-attachments/debug-symbols/dsym_${i}.dSYM 2>/dev/null
+  kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "
+    echo 'debug-symbol-dsym-${i}' | mc pipe local/${MINIO_BUCKET}/debug-symbols/dsym_${i}.dSYM 2>/dev/null
+  " 2>/dev/null
 done
 
-COUNT=$(mc ls --recursive local/glitchtip-attachments/ 2>/dev/null | wc -l)
-echo "OBJECT_COUNT=${COUNT}"
-MINIO_SETUP
-
-kubectl cp /tmp/minio_setup.sh glitchtip/${MINIO_POD}:/tmp/minio_setup.sh
-kubectl exec -n glitchtip "${MINIO_POD}" -- env MINIO_ACCESS_KEY="${MINIO_ACCESS_KEY}" MINIO_SECRET_KEY="${MINIO_SECRET_KEY}" bash /tmp/minio_setup.sh 2>&1
-
 # Verify
-OBJ_COUNT=$(kubectl exec -n glitchtip "${MINIO_POD}" -- bash -c "mc alias set local http://localhost:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY} >/dev/null 2>&1; mc ls --recursive local/${MINIO_BUCKET}/ 2>/dev/null | wc -l")
+OBJ_COUNT=$(kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "mc ls --recursive local/${MINIO_BUCKET}/ 2>/dev/null | wc -l")
 echo "[setup] MinIO objects created: ${OBJ_COUNT}"
 
 ###############################################
