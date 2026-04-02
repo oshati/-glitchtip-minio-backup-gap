@@ -136,7 +136,13 @@ spec:
             command:
             - /bin/bash
             - -c
-            - "cp /mc-bin/mc /tmp/mc 2>/dev/null; chmod +x /tmp/mc 2>/dev/null; export PATH=/tmp:$PATH; bash /scripts/backup.sh"
+            - |
+              cp /mc-bin/mc /tmp/mc 2>/dev/null || true
+              chmod +x /tmp/mc 2>/dev/null || true
+              ln -sf /mc-bin/mc /usr/local/bin/mc 2>/dev/null || ln -sf /tmp/mc /usr/local/bin/mc 2>/dev/null || true
+              export PATH=/mc-bin:/tmp:$PATH
+              echo "mc location: $(which mc 2>/dev/null || echo NOT_FOUND)"
+              bash /scripts/backup.sh
             volumeMounts:
             - name: backup-script
               mountPath: /scripts
