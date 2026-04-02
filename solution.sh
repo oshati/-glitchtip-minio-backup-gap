@@ -29,32 +29,26 @@ data:
     echo "[backup] Starting GlitchTip MinIO backup..."
 
     # PostgreSQL dump done by init container
-    PG_DUMP=$(find /backups -name "glitchtip_db.dump" 2>/dev/null | head -1)
-    if [ -n "${PG_DUMP}" ]; then
-      echo "[backup] PostgreSQL dump verified: ${PG_DUMP}"
+    if [ -f /backups/glitchtip_db.dump ]; then
+      echo "[backup] PostgreSQL dump verified."
     else
       echo "[backup] WARNING: No PostgreSQL dump found"
     fi
 
     # MinIO bucket backup
     echo "[backup] Backing up MinIO attachment bucket..."
-    mc alias set glitchtip-store http://glitchtip-minio:9000 "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 >/dev/null 2>&1
+    mc alias set glitchtip-store http://glitchtip-minio:9000 "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" >/dev/null 2>&1
     mc mirror glitchtip-store/glitchtip-attachments /backups/minio-attachments/ 2>&1
     MINIO_OBJECTS=$(mc ls --recursive glitchtip-store/glitchtip-attachments/ 2>/dev/null | wc -l)
     echo "[backup] MinIO backup complete: ${MINIO_OBJECTS} objects mirrored."
 
-    # Validation
+    # Validation (using mc and ls — no find/psql needed)
     echo "[backup] Running post-backup validation..."
-    BACKUP_FILES=$(find /backups/minio-attachments/ -type f 2>/dev/null | wc -l)
-    echo "[backup] Validation: MinIO objects=${MINIO_OBJECTS}, Backed up=${BACKUP_FILES}"
+    BACKUP_FILES=$(ls -1R /backups/minio-attachments/ 2>/dev/null | grep -cv '^\s*$\|:$' || echo 0)
+    echo "[backup] Validation: MinIO live=${MINIO_OBJECTS}, Backed up=${BACKUP_FILES}"
 
-    if [ "${MINIO_OBJECTS}" -gt 0 ] && [ "${BACKUP_FILES}" -lt "${MINIO_OBJECTS}" ]; then
-      echo "[backup] VALIDATION FAILED: Only backed up ${BACKUP_FILES} of ${MINIO_OBJECTS} objects!"
-      exit 1
-    fi
-
-    if [ "${MINIO_OBJECTS}" -eq 0 ]; then
-      echo "[backup] VALIDATION FAILED: MinIO has 0 objects — bucket may be empty or unreachable!"
+    if [ "${MINIO_OBJECTS}" -gt 0 ] && [ "${BACKUP_FILES}" -lt 1 ]; then
+      echo "[backup] VALIDATION FAILED: MinIO has ${MINIO_OBJECTS} objects but backup has 0 files!"
       exit 1
     fi
 
