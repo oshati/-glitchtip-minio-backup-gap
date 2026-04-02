@@ -132,7 +132,7 @@ spec:
               mountPath: /shared
           containers:
           - name: backup
-            image: docker.io/library/postgres:16-alpine
+            image: docker.io/bitnamilegacy/postgresql:17.0.0-debian-12-r11
             imagePullPolicy: IfNotPresent
             command:
             - /bin/bash
