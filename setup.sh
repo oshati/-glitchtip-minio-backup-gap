@@ -177,16 +177,15 @@ done
 ###############################################
 echo "[setup] Creating attachment bucket and sample files..."
 
-# Use mc inside a Job to configure MinIO
-kubectl run minio-setup --image=docker.io/minio/mc:RELEASE.2024-11-21T17-21-54Z \
-  --restart=Never --rm -i --namespace=glitchtip -- bash -c "
-mc alias set local http://glitchtip-minio:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY} 2>/dev/null
+# Use mc directly on the MinIO pod (minio/minio image includes mc)
+kubectl exec -n glitchtip "${MINIO_POD}" -- bash -c "
+mc alias set local http://localhost:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY} 2>/dev/null
 mc mb local/${MINIO_BUCKET} 2>/dev/null || true
 
 # Create 10 sample attachment files
 for i in \$(seq 1 10); do
-  echo \"crash-report-data-for-event-\${i}-stacktrace-binary-blob-content-\$(date +%s)\" | mc pipe local/${MINIO_BUCKET}/attachments/event_\${i}/crash_report_\${i}.dmp 2>/dev/null
-  echo \"source-map-bundle-for-service-\${i}-compressed-content\" | mc pipe local/${MINIO_BUCKET}/attachments/event_\${i}/sourcemap_\${i}.js.map 2>/dev/null
+  echo \"crash-report-data-for-event-\${i}-stacktrace-binary-blob\" | mc pipe local/${MINIO_BUCKET}/attachments/event_\${i}/crash_report_\${i}.dmp 2>/dev/null
+  echo \"source-map-bundle-for-service-\${i}\" | mc pipe local/${MINIO_BUCKET}/attachments/event_\${i}/sourcemap_\${i}.js.map 2>/dev/null
 done
 
 # Create 5 debug symbol files
@@ -194,9 +193,13 @@ for i in \$(seq 1 5); do
   echo \"debug-symbol-file-dsym-content-\${i}\" | mc pipe local/${MINIO_BUCKET}/debug-symbols/dsym_\${i}.dSYM 2>/dev/null
 done
 
-echo 'Bucket populated with 25 objects.'
+echo 'Bucket populated.'
 mc ls --recursive local/${MINIO_BUCKET}/ | wc -l
-" 2>/dev/null || echo "[setup] MinIO setup completed (may have warnings)"
+" 2>&1 || echo "[setup] MinIO setup had warnings"
+
+# Verify objects were created
+OBJ_COUNT=$(kubectl exec -n glitchtip "${MINIO_POD}" -- bash -c "mc alias set local http://localhost:9000 ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY} 2>/dev/null; mc ls --recursive local/${MINIO_BUCKET}/ 2>/dev/null | wc -l")
+echo "[setup] MinIO objects created: ${OBJ_COUNT}"
 
 ###############################################
 # INSERT ATTACHMENT METADATA IN POSTGRESQL
