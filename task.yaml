@@ -1,0 +1,36 @@
+id: null
+prompt: |
+  The platform team just ran a quarterly disaster recovery drill for GlitchTip.
+  They restored from the most recent PostgreSQL backup into the existing namespace
+  and everything looked fine at first — issues loaded, projects were visible, alert
+  rules were intact.
+
+  But then engineers started reporting that issue detail pages for events with file
+  attachments show broken links, and stack traces for a few services are incomplete.
+  Someone mentioned GlitchTip was migrated to use MinIO for attachment storage about
+  six months ago, but nobody is sure if the backup pipeline was updated to account for
+  that.
+
+  The backup runs as a Kubernetes CronJob somewhere in the cluster. Can you trace
+  the attachment storage path, figure out why the restored data is incomplete, and
+  fix the backup pipeline so this doesn't happen again? There should also be some
+  kind of validation step that catches this sort of gap before it becomes a problem.
+
+  The MinIO and GlitchTip credentials should be discoverable from the cluster
+  secrets and ConfigMaps.
+
+metadata:
+  category: platform-eng
+  spec_id: 9e4d158e-96ff-4435-ab39-4d1e389f4b47
+  difficulty: hard
+  domains:
+    - glitchtip
+    - error-tracking
+    - minio
+    - backup-recovery
+  components:
+    - GlitchTip
+    - PostgreSQL
+    - MinIO
+    - Kubernetes
+    - CronJob
