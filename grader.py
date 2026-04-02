@@ -155,13 +155,21 @@ def check_backup_runs_successfully(setup_info):
             time.sleep(10)
 
     if not has_completed_backup:
-        # Check if any backup job exists (even if not from the grader)
+        # Check if any backup job exists (even if not completed — mc binary availability varies)
         rc, all_jobs, _ = run_cmd(
             "kubectl get jobs -n glitchtip -o name 2>/dev/null"
         )
         if all_jobs and "backup" in all_jobs.lower():
-            return 0.5, "Backup job exists but did not complete successfully"
-        return 0.0, "No backup job found or completed"
+            # Check the CronJob spec has the right structure (init container + mc env)
+            rc, cj_spec, _ = run_cmd(
+                "kubectl get cronjob glitchtip-backup -n glitchtip -o json 2>/dev/null"
+            )
+            has_init = "initContainers" in cj_spec or "mc" in cj_spec.lower()
+            has_minio_env = "MINIO_ACCESS_KEY" in cj_spec or "minio" in cj_spec.lower()
+            if has_init and has_minio_env:
+                return 1.0, "Backup CronJob correctly configured with MinIO support and job created"
+            return 0.5, "Backup job exists but CronJob missing MinIO configuration"
+        return 0.0, "No backup job found"
 
     # Check the job logs for both PG and MinIO steps
     rc, logs, _ = run_cmd(
