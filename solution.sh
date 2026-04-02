@@ -125,10 +125,8 @@ spec:
           - name: mc-setup
             image: docker.io/minio/mc:RELEASE.2024-11-21T17-21-54Z
             imagePullPolicy: IfNotPresent
-            command: ["/bin/sh", "/scripts/mc-install.sh"]
+            command: ["/bin/sh", "-c", "cp /usr/bin/mc /shared/mc && chmod +x /shared/mc && echo mc copied"]
             volumeMounts:
-            - name: backup-script
-              mountPath: /scripts
             - name: mc-binary
               mountPath: /shared
           containers:
