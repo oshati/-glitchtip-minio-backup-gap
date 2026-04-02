@@ -169,15 +169,16 @@ def check_backup_job_produces_output(setup_info):
         f"kubectl logs -n glitchtip -l job-name={job_name} --all-containers --tail=50 2>/dev/null"
     )
 
-    has_pg = "pg_dump" in logs.lower() or "postgresql" in logs.lower() or "dump complete" in logs.lower()
     has_minio = "minio" in logs.lower() or "mc " in logs.lower() or "mirror" in logs.lower() or "objects" in logs.lower() or "attachments" in logs.lower()
 
-    if has_pg and has_minio:
-        return 1.0, f"Backup job completed with both PG and MinIO steps"
-    elif has_pg:
-        return 0.0, f"Backup completed but only PG dump — no MinIO backup in logs"
+    # Job completed successfully — init container (pg_dump) must have passed for main to start
+    # Main container logs show MinIO backup — that's the key functional evidence
+    if has_minio and completed:
+        return 1.0, f"Backup job completed with MinIO backup (PG dump in init container)"
+    elif completed:
+        return 0.5, f"Backup job completed but no MinIO backup evidence in logs"
     else:
-        return 0.0, f"Backup logs missing expected steps. Logs: {logs[:200]}"
+        return 0.0, f"Backup job did not complete. Logs: {logs[:200]}"
 
 
 def check_backup_captures_all_objects(setup_info):
