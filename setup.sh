@@ -322,6 +322,76 @@ spec:
 EOF
 
 ###############################################
+# BREAKAGE: CORRUPT MINIO CREDENTIALS FOR BACKUP
+# The glitchtip-minio-creds secret has the correct creds,
+# but create a SEPARATE backup-specific secret with WRONG creds
+# that the backup CronJob would use if the agent just copies
+# the pattern from the existing CronJob env vars.
+###############################################
+echo "[setup] Creating corrupted backup MinIO credentials..."
+
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: glitchtip-backup-minio-creds
+  namespace: glitchtip
+  labels:
+    app: glitchtip
+    component: backup
+  annotations:
+    description: "MinIO credentials for backup pipeline — rotated Q4 2024"
+type: Opaque
+stringData:
+  MINIO_ACCESS_KEY: "backup-service-account"
+  MINIO_SECRET_KEY: "rotated-key-expired-2024Q4"
+  MINIO_ENDPOINT: "http://glitchtip-minio:9000"
+  MINIO_BUCKET: "glitchtip-attachments"
+EOF
+
+###############################################
+# BREAKAGE: NETWORKPOLICY BLOCKING BACKUP PODS → MINIO
+# Backup pods (labeled job=backup) can't reach MinIO
+# unless the agent adds the right label or fixes the policy
+###############################################
+echo "[setup] Creating NetworkPolicy blocking backup pods from MinIO..."
+
+kubectl apply -f - <<'EOF'
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: glitchtip-minio-access-policy
+  namespace: glitchtip
+  labels:
+    app: glitchtip-minio
+  annotations:
+    description: "Restricts MinIO access to authorized workloads only"
+spec:
+  podSelector:
+    matchLabels:
+      app: glitchtip-minio
+  policyTypes:
+  - Ingress
+  ingress:
+  # Allow from GlitchTip web pods only
+  - from:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: glitchtip
+    ports:
+    - protocol: TCP
+      port: 9000
+  # Allow from pods with backup-authorized label (backup pods DON'T have this)
+  - from:
+    - podSelector:
+        matchLabels:
+          minio-access: authorized
+    ports:
+    - protocol: TCP
+      port: 9000
+EOF
+
+###############################################
 # DECOY DOCUMENTATION
 ###############################################
 echo "[setup] Creating documentation ConfigMaps..."
@@ -405,6 +475,8 @@ kubectl annotate configmap/glitchtip-backup-script -n glitchtip kubectl.kubernet
 kubectl annotate configmap/glitchtip-migration-log -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate configmap/glitchtip-dr-runbook -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate cronjob/glitchtip-backup -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+kubectl annotate secret/glitchtip-backup-minio-creds -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+kubectl annotate networkpolicy/glitchtip-minio-access-policy -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 
 ###############################################
 # SAVE SETUP INFO

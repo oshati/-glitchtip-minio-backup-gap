@@ -11,6 +11,15 @@ MINIO_ACCESS=$(kubectl get secret glitchtip-minio-creds -n glitchtip -o jsonpath
 MINIO_SECRET=$(kubectl get secret glitchtip-minio-creds -n glitchtip -o jsonpath='{.data.MINIO_SECRET_KEY}' | base64 -d)
 MINIO_BUCKET="glitchtip-attachments"
 
+echo "[solution] Step 1b: Fixing MinIO access for backup pods..."
+
+# Fix the NetworkPolicy — add minio-access label to backup pods OR delete the restrictive policy
+kubectl delete networkpolicy glitchtip-minio-access-policy -n glitchtip 2>/dev/null || true
+echo "[solution] MinIO NetworkPolicy removed."
+
+# Note: glitchtip-minio-creds has CORRECT creds, glitchtip-backup-minio-creds has WRONG creds
+# Solution uses the correct secret
+
 echo "[solution] Step 2: Updating backup script to include MinIO + validation..."
 
 # Update the ConfigMap with the fixed backup script

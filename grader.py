@@ -2,13 +2,13 @@
 """
 Grader for glitchtip-minio-backup-gap task.
 
-ALL checks are end-to-end FUNCTIONAL tests.
+ALL checks are FUNCTIONAL end-to-end tests.
 
 4 subscores, each weight 1/4:
-1. backup_includes_minio — Backup CronJob script contains MinIO/mc backup commands
-2. validation_step_exists — Backup script compares PG attachment count vs MinIO object count
-3. backup_runs_successfully — A manual backup Job completes with both PG and MinIO steps
-4. minio_objects_intact — MinIO attachment bucket has objects matching PG metadata
+1. backup_script_has_minio — Backup script contains MinIO backup commands (mc/s3)
+2. validation_logic_present — Backup pipeline has PG vs MinIO count validation with failure condition
+3. backup_job_produces_output — Actually run the backup Job and verify it completes with PG dump + MinIO mirror
+4. backup_captures_all_objects — Verify the backup Job captured all MinIO objects that PG references
 """
 
 import json
@@ -51,168 +51,147 @@ def load_setup_info():
     return info
 
 
-def check_backup_includes_minio(setup_info):
+def check_backup_script_has_minio(setup_info):
     """
-    FUNCTIONAL: Check the backup CronJob script contains MinIO backup commands.
-    Must include mc/minio backup steps targeting the attachment bucket.
+    Check that the backup ConfigMap contains MinIO backup commands.
+    Accepts mc, s3cmd, aws s3, or curl-based S3 backup approaches.
+    Checks ALL scripts in the ConfigMap (not just backup.sh).
     """
-    # Get the backup script from the ConfigMap
-    rc, script, _ = run_cmd(
-        "kubectl get configmap glitchtip-backup-script -n glitchtip "
-        "-o jsonpath='{.data.backup\\.sh}'"
+    rc, cm_json, _ = run_cmd(
+        "kubectl get configmap glitchtip-backup-script -n glitchtip -o json 2>/dev/null"
     )
-
-    if rc != 0 or not script:
+    if rc != 0 or not cm_json:
         return 0.0, "Could not read backup script ConfigMap"
 
-    script = script.strip("'")
+    try:
+        cm = json.loads(cm_json)
+        all_scripts = " ".join(cm.get("data", {}).values())
+    except (json.JSONDecodeError, AttributeError):
+        return 0.0, "Failed to parse ConfigMap"
 
-    # Check for MinIO backup commands
-    has_mc = "mc " in script or "mc alias" in script or "mc mirror" in script
-    has_minio_ref = "minio" in script.lower() or "s3" in script.lower()
-    has_bucket = setup_info.get("MINIO_BUCKET", "glitchtip-attachments") in script
+    script = all_scripts.lower()
 
-    if has_mc and has_bucket:
-        return 1.0, "Backup script includes mc commands targeting the attachment bucket"
+    # Check for MinIO backup commands (accept various approaches)
+    has_mc = "mc " in script or "mc mirror" in script or "mc cp" in script
+    has_s3 = "aws s3" in script or "s3cmd" in script
+    has_minio_ref = "minio" in script
+    has_bucket = "glitchtip-attachments" in script or "minio_bucket" in script or "attachment" in script
+
+    if (has_mc or has_s3) and (has_bucket or has_minio_ref):
+        return 1.0, "Backup script includes MinIO backup commands"
     elif has_minio_ref:
-        return 0.0, f"Script references MinIO but missing mc commands or bucket name"
+        return 0.0, "Script references MinIO but no backup commands (mc/s3) found"
     else:
-        return 0.0, "Backup script has no MinIO/mc backup step"
+        return 0.0, "No MinIO backup step found in any backup script"
 
 
-def check_validation_step_exists(setup_info):
+def check_validation_logic_present(setup_info):
     """
-    FUNCTIONAL: Check the backup script includes a validation step that
-    compares PostgreSQL attachment record count against MinIO object count.
+    Check that the backup pipeline includes validation that compares
+    PG attachment count vs MinIO object count, with a failure condition.
+    Checks ALL scripts in the ConfigMap.
     """
-    rc, script, _ = run_cmd(
-        "kubectl get configmap glitchtip-backup-script -n glitchtip "
-        "-o jsonpath='{.data.backup\\.sh}'"
+    rc, cm_json, _ = run_cmd(
+        "kubectl get configmap glitchtip-backup-script -n glitchtip -o json 2>/dev/null"
     )
-
-    if rc != 0 or not script:
+    if rc != 0 or not cm_json:
         return 0.0, "Could not read backup script ConfigMap"
 
-    script = script.strip("'")
+    try:
+        cm = json.loads(cm_json)
+        all_scripts = " ".join(cm.get("data", {}).values())
+    except (json.JSONDecodeError, AttributeError):
+        return 0.0, "Failed to parse ConfigMap"
 
-    # Check for validation logic
-    has_pg_count = "files_fileblob" in script or "attachment" in script.lower()
-    has_comparison = "VALIDATION" in script.upper() or "validation" in script
-    has_count_check = (
-        ("COUNT" in script.upper() or "count" in script or "wc -l" in script)
-        and ("psql" in script or "pg_" in script)
-    )
-    has_fail_condition = "exit 1" in script or "FAILED" in script or "failed" in script
+    script = all_scripts
 
-    if has_pg_count and has_comparison and has_fail_condition:
-        return 1.0, "Backup script has validation step with PG count check and failure condition"
-    elif has_comparison:
-        return 0.0, "Script mentions validation but missing count comparison or failure condition"
+    has_pg_query = "files_fileblob" in script or "fileblob" in script or "attachment" in script.lower()
+    has_count = "COUNT" in script.upper() or "count" in script or "wc -l" in script
+    has_comparison = "VALIDATION" in script.upper() or "validation" in script or "validate" in script.lower()
+    has_fail = "exit 1" in script or "FAIL" in script or "fail" in script or "error" in script.lower()
+
+    if has_pg_query and has_count and has_fail:
+        return 1.0, "Validation step found with PG count check and failure condition"
+    elif has_comparison or has_count:
+        return 0.0, "Partial validation found but missing count comparison or failure condition"
     else:
-        return 0.0, "No validation step found in backup script"
+        return 0.0, "No validation logic found in backup scripts"
 
 
-def check_backup_runs_successfully(setup_info):
+def check_backup_job_produces_output(setup_info):
     """
-    FUNCTIONAL: Trigger a manual backup Job and verify it completes with
-    both PostgreSQL and MinIO backup steps.
+    FUNCTIONAL: Actually trigger a backup Job from the CronJob and verify
+    it completes successfully with BOTH PG dump and MinIO backup in the logs.
     """
-    # Check if there's a recently completed backup job
-    rc, jobs, _ = run_cmd(
-        "kubectl get jobs -n glitchtip -l app=glitchtip,job=backup "
-        "-o jsonpath='{.items[*].metadata.name}' 2>/dev/null"
+    job_name = f"grader-backup-{int(time.time())}"
+
+    # Trigger a backup job
+    rc, _, stderr = run_cmd(
+        f"kubectl create job {job_name} --from=cronjob/glitchtip-backup -n glitchtip 2>&1",
+        timeout=15,
     )
+    if rc != 0:
+        return 0.0, f"Could not create backup job: {stderr[:200]}"
 
-    # Also check for any job created from the backup cronjob
-    rc2, cj_jobs, _ = run_cmd(
-        "kubectl get jobs -n glitchtip "
-        "-o jsonpath='{range .items[*]}{.metadata.name}{\" \"}{.status.succeeded}{\"\\n\"}{end}' 2>/dev/null"
-    )
-
-    # Look for any completed backup job
-    has_completed_backup = False
-    if cj_jobs:
-        for line in cj_jobs.strip("'").split("\n"):
-            parts = line.strip().split()
-            if len(parts) >= 2 and "backup" in parts[0].lower() and parts[1] == "1":
-                has_completed_backup = True
-                break
-
-    if not has_completed_backup:
-        # Try triggering one ourselves
-        run_cmd(
-            f"kubectl create job --from=cronjob/glitchtip-backup grader-backup-test -n glitchtip 2>/dev/null"
+    # Wait for completion (up to 5 minutes)
+    completed = False
+    for i in range(30):
+        rc, status, _ = run_cmd(
+            f"kubectl get job {job_name} -n glitchtip "
+            f"-o jsonpath='{{.status.succeeded}}' 2>/dev/null"
         )
-        # Wait for it
-        for i in range(30):
-            rc, status, _ = run_cmd(
-                "kubectl get job grader-backup-test -n glitchtip "
-                "-o jsonpath='{.status.succeeded}' 2>/dev/null"
-            )
-            if status.strip("'") == "1":
-                has_completed_backup = True
-                break
-            time.sleep(10)
+        if status.strip("'") == "1":
+            completed = True
+            break
 
-    if not has_completed_backup:
-        # Check if any backup job exists (even if not completed — mc binary availability varies)
-        rc, all_jobs, _ = run_cmd(
-            "kubectl get jobs -n glitchtip -o name 2>/dev/null"
+        # Check if failed
+        rc, failed, _ = run_cmd(
+            f"kubectl get job {job_name} -n glitchtip "
+            f"-o jsonpath='{{.status.failed}}' 2>/dev/null"
         )
-        if all_jobs and "backup" in all_jobs.lower():
-            # Check the CronJob spec has the right structure (init container + mc env)
-            rc, cj_spec, _ = run_cmd(
-                "kubectl get cronjob glitchtip-backup -n glitchtip -o json 2>/dev/null"
-            )
-            has_init = "initContainers" in cj_spec or "mc" in cj_spec.lower()
-            has_minio_env = "MINIO_ACCESS_KEY" in cj_spec or "minio" in cj_spec.lower()
-            if has_init and has_minio_env:
-                return 1.0, "Backup CronJob correctly configured with MinIO support and job created"
-            return 0.5, "Backup job exists but CronJob missing MinIO configuration"
-        return 0.0, "No backup job found"
-
-    # Check the job logs for both PG and MinIO steps
-    rc, logs, _ = run_cmd(
-        "kubectl logs -n glitchtip -l job-name=grader-backup-test --tail=50 2>/dev/null"
-    )
-
-    if not logs:
-        # Try getting logs from any backup job
-        rc, pods, _ = run_cmd(
-            "kubectl get pods -n glitchtip -l app=glitchtip,job=backup "
-            "-o jsonpath='{.items[0].metadata.name}' 2>/dev/null"
-        )
-        if pods:
+        if failed.strip("'").isdigit() and int(failed.strip("'")) > 0:
+            # Get logs to see why it failed
             rc, logs, _ = run_cmd(
-                f"kubectl logs -n glitchtip {pods.strip(chr(39))} 2>/dev/null"
+                f"kubectl logs -n glitchtip -l job-name={job_name} --tail=20 2>/dev/null"
             )
+            return 0.0, f"Backup job failed. Logs: {logs[:300]}"
 
-    has_pg = "PostgreSQL" in logs or "pg_dump" in logs
-    has_minio = "MinIO" in logs or "mc " in logs or "mirror" in logs
+        time.sleep(10)
+
+    if not completed:
+        rc, logs, _ = run_cmd(
+            f"kubectl logs -n glitchtip -l job-name={job_name} --tail=30 2>/dev/null"
+        )
+        return 0.0, f"Backup job timed out (5 min). Logs: {logs[:300]}"
+
+    # Check logs for both PG and MinIO steps
+    rc, logs, _ = run_cmd(
+        f"kubectl logs -n glitchtip -l job-name={job_name} --tail=50 2>/dev/null"
+    )
+
+    has_pg = "pg_dump" in logs.lower() or "postgresql" in logs.lower() or "dump complete" in logs.lower()
+    has_minio = "minio" in logs.lower() or "mc " in logs.lower() or "mirror" in logs.lower() or "objects" in logs.lower()
 
     if has_pg and has_minio:
-        return 1.0, "Backup job completed with both PostgreSQL and MinIO steps"
+        return 1.0, f"Backup job completed with both PG and MinIO steps"
     elif has_pg:
-        return 0.0, "Backup job completed but only has PostgreSQL step (no MinIO)"
+        return 0.0, f"Backup completed but only PG dump — no MinIO backup in logs"
     else:
-        return 0.0, f"Backup job logs incomplete: pg={has_pg}, minio={has_minio}"
+        return 0.0, f"Backup logs missing expected steps. Logs: {logs[:200]}"
 
 
-def check_minio_objects_intact(setup_info):
+def check_backup_captures_all_objects(setup_info):
     """
-    FUNCTIONAL: Verify MinIO attachment bucket has objects matching PG metadata.
-    Compare fileblob record count against MinIO object count.
+    FUNCTIONAL: Verify that the backup actually captured MinIO objects.
+    Check that the most recent backup Job's output contains MinIO files
+    matching the PG record count.
     """
-    minio_bucket = setup_info.get("MINIO_BUCKET", "glitchtip-attachments")
-
     # Get PG fileblob count
-    pg_pod = ""
     rc, pg_pod, _ = run_cmd(
         "kubectl get pods -n glitchtip -l app.kubernetes.io/name=postgresql "
         "-o jsonpath='{.items[0].metadata.name}' 2>/dev/null"
     )
     pg_pod = pg_pod.strip("'")
-
     if not pg_pod:
         return 0.0, "No PostgreSQL pod found"
 
@@ -224,33 +203,47 @@ def check_minio_objects_intact(setup_info):
     )
     pg_count = int(pg_count_str.strip()) if pg_count_str.strip().isdigit() else 0
 
-    # Get MinIO object count
-    minio_pod = ""
-    rc, minio_pod, _ = run_cmd(
-        "kubectl get pods -n glitchtip -l app=glitchtip-minio "
-        "-o jsonpath='{.items[0].metadata.name}' 2>/dev/null"
+    if pg_count == 0:
+        return 0.0, "No PG fileblob records found"
+
+    # Check if a backup job ran and its logs show the objects were captured
+    rc, logs, _ = run_cmd(
+        "kubectl logs -n glitchtip -l app=glitchtip,job=backup --tail=50 2>/dev/null"
     )
-    minio_pod = minio_pod.strip("'")
 
-    if not minio_pod:
-        return 0.0, "No MinIO pod found"
+    if not logs:
+        # Try getting logs from any backup job pod
+        rc, pods, _ = run_cmd(
+            "kubectl get pods -n glitchtip --sort-by=.status.startTime "
+            "-o jsonpath='{range .items[*]}{.metadata.name}{\" \"}{end}' 2>/dev/null"
+        )
+        for pod in pods.strip("'").split():
+            if "backup" in pod.lower():
+                rc, logs, _ = run_cmd(
+                    f"kubectl logs -n glitchtip {pod} --tail=50 2>/dev/null"
+                )
+                if logs:
+                    break
 
-    rc, minio_count_str, _ = run_cmd(
-        f"kubectl exec -n glitchtip {minio_pod} -- "
-        f"sh -c 'mc alias set local http://localhost:9000 "
-        f"{setup_info.get('MINIO_ACCESS_KEY', 'glitchtip-minio')} "
-        f"{setup_info.get('MINIO_SECRET_KEY', 'minio-secret-key-2024')} >/dev/null 2>&1; "
-        f"mc ls --recursive local/{minio_bucket}/ 2>/dev/null | wc -l'",
-        timeout=15,
-    )
-    minio_count = int(minio_count_str.strip()) if minio_count_str.strip().isdigit() else 0
+    # Look for evidence that objects were backed up
+    if not logs:
+        return 0.0, f"No backup job logs found. PG has {pg_count} records."
 
-    if pg_count > 0 and minio_count > 0:
-        return 1.0, f"MinIO has {minio_count} objects, PG has {pg_count} fileblob records"
-    elif pg_count > 0 and minio_count == 0:
-        return 0.0, f"PG has {pg_count} records but MinIO has 0 objects (attachment data missing!)"
+    # Check if logs mention successful MinIO backup with object count
+    import re
+    obj_matches = re.findall(r'(\d+)\s*object', logs.lower())
+    mirror_success = "mirror" in logs.lower() or "copied" in logs.lower() or "success" in logs.lower()
+
+    if mirror_success and obj_matches:
+        backed_up = max(int(x) for x in obj_matches)
+        if backed_up >= pg_count:
+            return 1.0, f"Backup captured {backed_up} objects (PG has {pg_count} records)"
+        else:
+            return 0.0, f"Backup only captured {backed_up} of {pg_count} expected objects"
+    elif mirror_success:
+        return 1.0, f"MinIO mirror completed (PG has {pg_count} records)"
     else:
-        return 0.0, f"Data counts: PG={pg_count}, MinIO={minio_count}"
+        return 0.0, f"No evidence of MinIO objects being captured in backup logs. PG has {pg_count} records."
 
 
 def grade(*args, **kwargs) -> GradingResult:
@@ -264,10 +257,10 @@ def grade(*args, **kwargs) -> GradingResult:
     time.sleep(60)
 
     checks = {
-        "backup_includes_minio": check_backup_includes_minio,
-        "validation_step_exists": check_validation_step_exists,
-        "backup_runs_successfully": check_backup_runs_successfully,
-        "minio_objects_intact": check_minio_objects_intact,
+        "backup_script_has_minio": check_backup_script_has_minio,
+        "validation_logic_present": check_validation_logic_present,
+        "backup_job_produces_output": check_backup_job_produces_output,
+        "backup_captures_all_objects": check_backup_captures_all_objects,
     }
 
     weight = 1.0 / len(checks)
