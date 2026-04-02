@@ -164,13 +164,13 @@ def check_backup_job_produces_output(setup_info):
         )
         return 0.0, f"Backup job timed out (5 min). Logs: {logs[:300]}"
 
-    # Check logs for both PG and MinIO steps
+    # Check logs from ALL containers (init + main) for both PG and MinIO steps
     rc, logs, _ = run_cmd(
-        f"kubectl logs -n glitchtip -l job-name={job_name} --tail=50 2>/dev/null"
+        f"kubectl logs -n glitchtip -l job-name={job_name} --all-containers --tail=50 2>/dev/null"
     )
 
     has_pg = "pg_dump" in logs.lower() or "postgresql" in logs.lower() or "dump complete" in logs.lower()
-    has_minio = "minio" in logs.lower() or "mc " in logs.lower() or "mirror" in logs.lower() or "objects" in logs.lower()
+    has_minio = "minio" in logs.lower() or "mc " in logs.lower() or "mirror" in logs.lower() or "objects" in logs.lower() or "attachments" in logs.lower()
 
     if has_pg and has_minio:
         return 1.0, f"Backup job completed with both PG and MinIO steps"
