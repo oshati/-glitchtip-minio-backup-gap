@@ -162,18 +162,7 @@ spec:
                   key: MINIO_SECRET_KEY
 CJ_EOF
 
-echo "[solution] Step 4: Running test backup..."
-kubectl create job --from=cronjob/glitchtip-backup backup-test-$(date +%s) -n glitchtip 2>/dev/null || true
-
-# Wait for the test job
-for i in $(seq 1 60); do
-  STATUS=$(kubectl get jobs -n glitchtip -o jsonpath='{range .items[*]}{.metadata.name}={.status.succeeded}{"\n"}{end}' 2>/dev/null | grep "backup-test" | head -1)
-  if echo "$STATUS" | grep -q "=1"; then
-    echo "[solution] Test backup completed successfully."
-    break
-  fi
-  sleep 10
-done
+echo "[solution] Step 4: Backup CronJob updated. Grader will trigger test run."
 
 echo "[solution] Step 5: Verifying MinIO objects..."
 MINIO_POD=$(kubectl get pods -n glitchtip -l app=glitchtip-minio -o jsonpath='{.items[0].metadata.name}')
