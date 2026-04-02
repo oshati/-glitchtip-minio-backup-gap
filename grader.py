@@ -229,9 +229,9 @@ def check_minio_objects_intact(setup_info):
 
     rc, minio_count_str, _ = run_cmd(
         f"kubectl exec -n glitchtip {minio_pod} -- "
-        f"bash -c 'mc alias set local http://localhost:9000 "
+        f"sh -c 'mc alias set local http://localhost:9000 "
         f"{setup_info.get('MINIO_ACCESS_KEY', 'glitchtip-minio')} "
-        f"{setup_info.get('MINIO_SECRET_KEY', 'minio-secret-key-2024')} 2>/dev/null; "
+        f"{setup_info.get('MINIO_SECRET_KEY', 'minio-secret-key-2024')} >/dev/null 2>&1; "
         f"mc ls --recursive local/{minio_bucket}/ 2>/dev/null | wc -l'",
         timeout=15,
     )
