@@ -56,17 +56,22 @@ data:
     MINIO_OBJECTS=$(mc ls --recursive glitchtip-store/glitchtip-attachments/ 2>/dev/null | wc -l)
     echo "[backup] MinIO backup complete: ${MINIO_OBJECTS} objects mirrored."
 
-    # Validation (using mc and ls — no find/psql needed)
+    # Validation
     echo "[backup] Running post-backup validation..."
-    BACKUP_FILES=$(ls -1R /backups/minio-attachments/ 2>/dev/null | grep -cv '^\s*$\|:$' || echo 0)
-    echo "[backup] Validation: MinIO live=${MINIO_OBJECTS}, Backed up=${BACKUP_FILES}"
+    BACKUP_FILES=$(find /backups/minio-attachments/ -type f 2>/dev/null | wc -l)
+    echo "[backup] Validation: MinIO live=${MINIO_OBJECTS}, Backed up files=${BACKUP_FILES}"
 
-    if [ "${MINIO_OBJECTS}" -gt 0 ] && [ "${BACKUP_FILES}" -lt 1 ]; then
-      echo "[backup] VALIDATION FAILED: MinIO has ${MINIO_OBJECTS} objects but backup has 0 files!"
+    if [ "${MINIO_OBJECTS}" -gt 0 ] && [ "${BACKUP_FILES}" -eq 0 ]; then
+      echo "[backup] VALIDATION FAILED: MinIO has ${MINIO_OBJECTS} objects but backup captured 0 files — possible mismatch!"
       exit 1
     fi
 
-    echo "[backup] Backup and validation complete. ${MINIO_OBJECTS} objects verified."
+    if [ "${MINIO_OBJECTS}" -eq 0 ]; then
+      echo "[backup] VALIDATION FAILED: MinIO reports 0 objects — bucket may be empty or unreachable"
+      exit 1
+    fi
+
+    echo "[backup] Backup and validation complete. ${MINIO_OBJECTS} objects mirrored, ${BACKUP_FILES} files captured."
 SCRIPT_EOF
 
 echo "[solution] Step 3: Updating CronJob with pg17 init + mc main container..."
