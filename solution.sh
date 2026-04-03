@@ -56,22 +56,24 @@ data:
     MINIO_OBJECTS=$(mc ls --recursive glitchtip-store/glitchtip-attachments/ 2>/dev/null | wc -l)
     echo "[backup] MinIO backup complete: ${MINIO_OBJECTS} objects mirrored."
 
-    # Validation
+    # Validation — compare PG fileblob count (from init container) against MinIO object count
     echo "[backup] Running post-backup validation..."
-    BACKUP_FILES=$(mc ls --recursive glitchtip-store/glitchtip-attachments/ 2>/dev/null | wc -l)
-    echo "[backup] Validation: MinIO live=${MINIO_OBJECTS}, Backed up files=${BACKUP_FILES}"
+    PG_COUNT=$(cat /backups/.pg_fileblob_count 2>/dev/null | tr -d '[:space:]')
+    PG_COUNT=${PG_COUNT:-0}
+    echo "[backup] Validation: PG fileblob records=${PG_COUNT}, MinIO objects=${MINIO_OBJECTS}"
 
-    if [ "${MINIO_OBJECTS}" -gt 0 ] && [ "${BACKUP_FILES}" -eq 0 ]; then
-      echo "[backup] VALIDATION FAILED: MinIO has ${MINIO_OBJECTS} objects but backup captured 0 files — possible mismatch!"
+    if [ "${PG_COUNT}" -gt "${MINIO_OBJECTS}" ]; then
+      DIFF=$((PG_COUNT - MINIO_OBJECTS))
+      echo "[backup] VALIDATION FAILED: PG has ${PG_COUNT} records but MinIO only has ${MINIO_OBJECTS} objects — ${DIFF} missing!"
       exit 1
     fi
 
     if [ "${MINIO_OBJECTS}" -eq 0 ]; then
-      echo "[backup] VALIDATION FAILED: MinIO reports 0 objects — bucket may be empty or unreachable"
+      echo "[backup] VALIDATION FAILED: MinIO has 0 objects — bucket may be empty or unreachable"
       exit 1
     fi
 
-    echo "[backup] Backup and validation complete. ${MINIO_OBJECTS} objects mirrored, ${BACKUP_FILES} files captured."
+    echo "[backup] Backup and validation complete. PG=${PG_COUNT}, MinIO=${MINIO_OBJECTS} — consistent."
 SCRIPT_EOF
 
 echo "[solution] Step 3: Updating CronJob with pg17 init + mc main container..."
@@ -119,6 +121,10 @@ spec:
               PGPASSWORD="${PGPASSWORD}" pg_dump -h glitchtip-postgresql -U postgres -d postgres \
                 --format=custom --file="/backups/glitchtip_db.dump"
               echo "[backup] PostgreSQL dump complete."
+              # Write PG fileblob count for validation by main container
+              PGPASSWORD="${PGPASSWORD}" psql -h glitchtip-postgresql -U postgres -d postgres \
+                -tAc "SELECT COUNT(*) FROM files_fileblob;" > /backups/.pg_fileblob_count 2>/dev/null || echo "0" > /backups/.pg_fileblob_count
+              echo "[backup] PG fileblob count: $(cat /backups/.pg_fileblob_count)"
             volumeMounts:
             - name: backup-storage
               mountPath: /backups
