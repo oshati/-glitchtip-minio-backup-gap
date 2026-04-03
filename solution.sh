@@ -58,7 +58,7 @@ data:
 
     # Validation
     echo "[backup] Running post-backup validation..."
-    BACKUP_FILES=$(find /backups/minio-attachments/ -type f 2>/dev/null | wc -l)
+    BACKUP_FILES=$(mc ls --recursive glitchtip-store/glitchtip-attachments/ 2>/dev/null | wc -l)
     echo "[backup] Validation: MinIO live=${MINIO_OBJECTS}, Backed up files=${BACKUP_FILES}"
 
     if [ "${MINIO_OBJECTS}" -gt 0 ] && [ "${BACKUP_FILES}" -eq 0 ]; then
