@@ -173,12 +173,32 @@ for i in $(seq 1 30); do
 done
 
 ###############################################
+# MOVE MINIO CREDS TO SECRETREF FIRST (before creating objects)
+# This causes a restart — must be done before populating data
+###############################################
+echo "[setup] Moving MinIO creds to secretRef..."
+kubectl patch deployment glitchtip-minio -n glitchtip --type json -p '[
+  {"op": "replace", "path": "/spec/template/spec/containers/0/env/0", "value": {"name": "MINIO_ROOT_USER", "valueFrom": {"secretKeyRef": {"name": "glitchtip-minio-creds", "key": "MINIO_ACCESS_KEY"}}}},
+  {"op": "replace", "path": "/spec/template/spec/containers/0/env/1", "value": {"name": "MINIO_ROOT_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "glitchtip-minio-creds", "key": "MINIO_SECRET_KEY"}}}}
+]' 2>/dev/null || true
+kubectl rollout status deployment/glitchtip-minio -n glitchtip --timeout=120s || true
+
+# Wait for MinIO to come back after secretRef restart
+for i in $(seq 1 30); do
+  MINIO_POD=$(kubectl get pods -n glitchtip -l app=glitchtip-minio -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  if [ -n "${MINIO_POD}" ] && kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "mc alias set local http://localhost:9000 '${MINIO_ACCESS_KEY}' '${MINIO_SECRET_KEY}' >/dev/null 2>&1 && mc ls local/ >/dev/null 2>&1" 2>/dev/null; then
+    echo "[setup] MinIO back with secretRef creds."
+    break
+  fi
+  sleep 5
+done
+
+###############################################
 # CREATE BUCKET AND POPULATE WITH ATTACHMENTS
 ###############################################
 echo "[setup] Creating attachment bucket and sample files..."
 
-# Write the MinIO setup script to a file to avoid quoting issues
-# Create objects directly via kubectl exec (no kubectl cp — container lacks tar)
+MINIO_POD=$(kubectl get pods -n glitchtip -l app=glitchtip-minio -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "
 mc alias set local http://localhost:9000 '${MINIO_ACCESS_KEY}' '${MINIO_SECRET_KEY}' >/dev/null 2>&1
 mc mb local/${MINIO_BUCKET} 2>/dev/null || true
@@ -561,25 +581,7 @@ stringData:
   bucket: "glitchtip-attachments-archive"
 EOF
 
-###############################################
-# MOVE MINIO CREDS TO SECRETREF (hide from plaintext env)
-###############################################
-echo "[setup] Moving MinIO creds to secretRef..."
-kubectl patch deployment glitchtip-minio -n glitchtip --type json -p '[
-  {"op": "replace", "path": "/spec/template/spec/containers/0/env/0", "value": {"name": "MINIO_ROOT_USER", "valueFrom": {"secretKeyRef": {"name": "glitchtip-minio-creds", "key": "MINIO_ACCESS_KEY"}}}},
-  {"op": "replace", "path": "/spec/template/spec/containers/0/env/1", "value": {"name": "MINIO_ROOT_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "glitchtip-minio-creds", "key": "MINIO_SECRET_KEY"}}}}
-]' 2>/dev/null || true
-kubectl rollout status deployment/glitchtip-minio -n glitchtip --timeout=120s || true
-
-# Wait for MinIO to come back
-for i in $(seq 1 30); do
-  MINIO_POD=$(kubectl get pods -n glitchtip -l app=glitchtip-minio -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
-  if kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "mc alias set local http://localhost:9000 '${MINIO_ACCESS_KEY}' '${MINIO_SECRET_KEY}' >/dev/null 2>&1 && mc ls local/${MINIO_BUCKET}/ >/dev/null 2>&1" 2>/dev/null; then
-    echo "[setup] MinIO back with secretRef creds."
-    break
-  fi
-  sleep 5
-done
+# (secretRef patch already applied earlier, before object creation)
 
 ###############################################
 # MISLEADING DOCUMENTATION (no longer tells the agent the answer)
