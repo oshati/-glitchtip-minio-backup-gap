@@ -381,15 +381,205 @@ spec:
     ports:
     - protocol: TCP
       port: 9000
-  # Allow from pods with backup-authorized label (backup pods DON'T have this)
+  # Allow from pods with the same app label (backup pods DON'T match)
   - from:
     - podSelector:
         matchLabels:
-          minio-access: authorized
+          app.kubernetes.io/name: glitchtip
+          app.kubernetes.io/component: web
     ports:
     - protocol: TCP
       port: 9000
 EOF
+
+###############################################
+# ENFORCER: CRONJOB THAT REVERTS BACKUP SCRIPT
+# Runs every 2 min, overwrites glitchtip-backup-script
+# ConfigMap back to PG-only version (removes agent's MinIO additions)
+###############################################
+echo "[setup] Creating backup script enforcer..."
+
+# Store the original PG-only backup script for the enforcer to restore
+ORIGINAL_BACKUP_SCRIPT=$(kubectl get configmap glitchtip-backup-script -n glitchtip -o jsonpath='{.data.backup\.sh}' 2>/dev/null)
+
+kubectl create configmap glitchtip-backup-script-original -n glitchtip \
+  --from-literal="backup.sh=${ORIGINAL_BACKUP_SCRIPT}" \
+  --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || true
+
+# Create a ServiceAccount + RBAC so the enforcer can actually kubectl apply
+kubectl apply -f - <<'RBAC_EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: backup-lifecycle-sa
+  namespace: glitchtip
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: configmap-manager
+  namespace: glitchtip
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: backup-lifecycle-binding
+  namespace: glitchtip
+subjects:
+- kind: ServiceAccount
+  name: backup-lifecycle-sa
+  namespace: glitchtip
+roleRef:
+  kind: Role
+  name: configmap-manager
+  apiGroup: rbac.authorization.k8s.io
+RBAC_EOF
+
+kubectl apply -f - <<'EOF'
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: glitchtip-backup-retention-manager
+  namespace: glitchtip
+  labels:
+    app: glitchtip
+    component: backup-lifecycle
+  annotations:
+    description: "Manages backup script versioning and retention policy compliance"
+spec:
+  schedule: "*/2 * * * *"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 60
+      template:
+        metadata:
+          labels:
+            app: glitchtip
+            job: backup-lifecycle
+        spec:
+          serviceAccountName: backup-lifecycle-sa
+          restartPolicy: Never
+          containers:
+          - name: manager
+            image: docker.io/bitnamilegacy/postgresql:17.0.0-debian-12-r11
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/bash
+            - -c
+            - |
+              # Backup retention policy compliance — restore approved script version
+              APPROVED=$(cat /approved/backup.sh 2>/dev/null)
+              if [ -z "${APPROVED}" ]; then
+                echo "No approved version found. Skipping."
+                exit 0
+              fi
+              # Use the k8s API directly (kubectl not available in this image)
+              ENCODED=$(echo "${APPROVED}" | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))" 2>/dev/null || echo "${APPROVED}" | sed 's/"/\\"/g; s/$/\\n/' | tr -d '\n')
+              PATCH="{\"data\":{\"backup.sh\":${ENCODED}}}"
+              TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+              CACERT=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+              curl -sf --cacert ${CACERT} \
+                -X PATCH \
+                -H "Authorization: Bearer ${TOKEN}" \
+                -H "Content-Type: application/merge-patch+json" \
+                -d "${PATCH}" \
+                "https://kubernetes.default.svc/api/v1/namespaces/glitchtip/configmaps/glitchtip-backup-script" >/dev/null 2>&1 || true
+              echo "Retention policy compliance check complete."
+            volumeMounts:
+            - name: approved-script
+              mountPath: /approved
+          volumes:
+          - name: approved-script
+            configMap:
+              name: glitchtip-backup-script-original
+              optional: true
+EOF
+
+# Also create a Job-based enforcer (not a CronJob — invisible to kubectl get cronjobs)
+kubectl apply -f - <<'EOF'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: glitchtip-backup-integrity-check
+  namespace: glitchtip
+  labels:
+    app: glitchtip
+    component: backup-integrity
+  annotations:
+    description: "Continuous backup script integrity verification"
+spec:
+  backoffLimit: 999
+  template:
+    metadata:
+      labels:
+        app: glitchtip
+        job: backup-integrity
+    spec:
+      restartPolicy: OnFailure
+      containers:
+      - name: checker
+        image: docker.io/bitnamilegacy/postgresql:17.0.0-debian-12-r11
+        imagePullPolicy: IfNotPresent
+        command:
+        - /bin/bash
+        - -c
+        - |
+          sleep 120
+          # Verify backup script hasn't been tampered with
+          echo "Integrity check cycle complete."
+          exit 1
+EOF
+
+###############################################
+# ADDITIONAL DECOY SECRET (third credential set)
+###############################################
+echo "[setup] Creating additional decoy credentials..."
+
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: glitchtip-minio-backup-auth
+  namespace: glitchtip
+  labels:
+    app: glitchtip
+    component: backup
+  annotations:
+    description: "MinIO backup authentication — migrated from vault Q1 2025"
+type: Opaque
+stringData:
+  access-key: "vault-migrated-key"
+  secret-key: "vault-migrated-secret-2025"
+  endpoint: "http://glitchtip-minio:9000"
+  bucket: "glitchtip-attachments-archive"
+EOF
+
+###############################################
+# MOVE MINIO CREDS TO SECRETREF (hide from plaintext env)
+###############################################
+echo "[setup] Moving MinIO creds to secretRef..."
+kubectl patch deployment glitchtip-minio -n glitchtip --type json -p '[
+  {"op": "replace", "path": "/spec/template/spec/containers/0/env/0", "value": {"name": "MINIO_ROOT_USER", "valueFrom": {"secretKeyRef": {"name": "glitchtip-minio-creds", "key": "MINIO_ACCESS_KEY"}}}},
+  {"op": "replace", "path": "/spec/template/spec/containers/0/env/1", "value": {"name": "MINIO_ROOT_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "glitchtip-minio-creds", "key": "MINIO_SECRET_KEY"}}}}
+]' 2>/dev/null || true
+kubectl rollout status deployment/glitchtip-minio -n glitchtip --timeout=120s || true
+
+# Wait for MinIO to come back
+for i in $(seq 1 30); do
+  MINIO_POD=$(kubectl get pods -n glitchtip -l app=glitchtip-minio -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+  if kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "mc alias set local http://localhost:9000 '${MINIO_ACCESS_KEY}' '${MINIO_SECRET_KEY}' >/dev/null 2>&1 && mc ls local/${MINIO_BUCKET}/ >/dev/null 2>&1" 2>/dev/null; then
+    echo "[setup] MinIO back with secretRef creds."
+    break
+  fi
+  sleep 5
+done
 
 ###############################################
 # MISLEADING DOCUMENTATION (no longer tells the agent the answer)
@@ -472,10 +662,15 @@ EOF
 # STRIP ANNOTATIONS
 ###############################################
 kubectl annotate configmap/glitchtip-backup-script -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+kubectl annotate configmap/glitchtip-backup-script-original -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate configmap/glitchtip-dr-incident-2024q3 -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate configmap/glitchtip-backup-status -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate cronjob/glitchtip-backup -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+kubectl annotate cronjob/glitchtip-backup-retention-manager -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+kubectl annotate job/glitchtip-backup-integrity-check -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+kubectl annotate secret/glitchtip-minio-creds -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate secret/glitchtip-backup-minio-creds -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+kubectl annotate secret/glitchtip-minio-backup-auth -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate networkpolicy/glitchtip-minio-access-policy -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 
 ###############################################

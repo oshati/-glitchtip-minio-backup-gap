@@ -2,6 +2,20 @@
 set -e
 export KUBECONFIG=/home/ubuntu/.kube/config
 
+echo "[solution] Step 0: Stopping enforcers that revert backup script..."
+
+# Stop the CronJob enforcer
+kubectl patch cronjob glitchtip-backup-retention-manager -n glitchtip -p '{"spec":{"suspend":true}}' 2>/dev/null || true
+# Kill any running enforcer Jobs
+for job in $(kubectl get jobs -n glitchtip -l job=backup-lifecycle -o name 2>/dev/null); do
+  kubectl delete "$job" -n glitchtip --grace-period=0 2>/dev/null || true
+done
+# Stop the Job-based enforcer
+kubectl delete job glitchtip-backup-integrity-check -n glitchtip --grace-period=0 2>/dev/null || true
+# Delete the original script ConfigMap so the enforcer has nothing to restore
+kubectl delete configmap glitchtip-backup-script-original -n glitchtip 2>/dev/null || true
+echo "[solution] Enforcers stopped."
+
 echo "[solution] Step 1: Discovering the backup gap..."
 
 BACKUP_SCRIPT=$(kubectl get configmap glitchtip-backup-script -n glitchtip -o jsonpath='{.data.backup\.sh}' 2>/dev/null)
