@@ -392,7 +392,7 @@ spec:
 EOF
 
 ###############################################
-# DECOY DOCUMENTATION
+# MISLEADING DOCUMENTATION (no longer tells the agent the answer)
 ###############################################
 echo "[setup] Creating documentation ConfigMaps..."
 
@@ -400,80 +400,80 @@ kubectl apply -f - <<EOF
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: glitchtip-migration-log
+  name: glitchtip-dr-incident-2024q3
   namespace: glitchtip
   labels:
     app: glitchtip
     component: documentation
   annotations:
-    date: "2024-03-15"
+    date: "2024-09-22"
 data:
-  migration-log.md: |
-    # GlitchTip Storage Migration Log
-    ## March 2024 — Migrated to MinIO for attachment storage
+  incident-report.md: |
+    # GlitchTip DR Drill Incident — Q3 2024
+    ## Summary
+    During the Q3 disaster recovery drill, the restored GlitchTip instance
+    showed missing issue data for approximately 3 hours. Root cause was
+    identified as a TLS certificate expiration on the PostgreSQL connection
+    which caused the pg_restore to silently skip several tables.
 
-    ### Changes Made
-    - Deployed MinIO in glitchtip namespace (glitchtip-minio service)
-    - Updated DEFAULT_FILE_STORAGE to use storages.backends.s3boto3.S3Boto3Storage
-    - Configured AWS_STORAGE_BUCKET_NAME=glitchtip-attachments
-    - Migrated existing attachments from local volume to MinIO bucket
-    - Updated GlitchTip Helm values to include MinIO endpoint config
+    ## Root Cause
+    The backup CronJob connected to PostgreSQL via the service endpoint
+    which had a stale TLS certificate. The pg_dump completed but some
+    table dumps were truncated. On restore, these tables had fewer rows
+    than expected.
 
-    ### What Was NOT Updated
-    - Backup CronJob (glitchtip-backup) — TODO: add MinIO backup step
-    - Monitoring — TODO: add MinIO health check to Prometheus
-    - DR runbook — TODO: update with MinIO restore procedure
+    ## Resolution
+    - Rotated the PostgreSQL TLS certificates
+    - Added certificate expiration monitoring to Prometheus
+    - Re-ran pg_dump with verified connection
+    - Backup pipeline confirmed healthy after fix
 
-    ### MinIO Access
-    - Endpoint: http://glitchtip-minio:9000
-    - Console: http://glitchtip-minio:9001
-    - Credentials: see glitchtip-minio-creds secret
-    - Bucket: glitchtip-attachments
-
-    ### Ticket References
-    - PLAT-1042: Migrate GlitchTip attachments to object storage
-    - PLAT-1089: Update backup pipeline for MinIO (OPEN — not started)
+    ## Action Items (all completed)
+    - [x] Rotate PostgreSQL TLS certificates quarterly
+    - [x] Add cert expiration alert to PagerDuty
+    - [x] Verify backup integrity with row count checks
+    - [x] Update DR runbook with TLS verification step
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: glitchtip-dr-runbook
+  name: glitchtip-backup-status
   namespace: glitchtip
   labels:
     app: glitchtip
     component: documentation
 data:
-  dr-runbook.md: |
-    # GlitchTip Disaster Recovery Runbook
-    ## Last Updated: September 2024
+  status.md: |
+    # GlitchTip Backup Pipeline Status
+    ## Last Audit: January 2025
 
-    ### Backup
-    The glitchtip-backup CronJob runs daily at 2 AM and creates:
-    - PostgreSQL custom-format dump (glitchtip_db.dump)
-    - Backup manifest with metadata
+    ### Current State
+    - Backup CronJob: glitchtip-backup (runs daily at 2 AM)
+    - Backup type: PostgreSQL custom-format dump
+    - Storage: emptyDir (backup files are ephemeral — not persisted to PVC)
+    - Retention: 3 successful job history
 
-    ### Restore Procedure
-    1. Scale down glitchtip-web to 0 replicas
-    2. Restore PostgreSQL: pg_restore -h glitchtip-postgresql -U postgres -d postgres glitchtip_db.dump
-    3. Scale up glitchtip-web
-    4. Verify issues and projects load correctly
+    ### Recent Changes
+    - Q4 2024: Fixed TLS certificate issue (see incident report)
+    - Q4 2024: Added backup manifest with table row counts
+    - Q1 2025: Upgraded to PostgreSQL 17 (note: backup container image
+      may need updating to match server version)
 
-    ### Known Gaps
-    - Attachment storage (MinIO) is NOT included in the backup pipeline
-    - Debug symbols stored in MinIO will be lost on restore
-    - Ticket PLAT-1089 tracks this gap but is unresolved
+    ### Known Issues
+    - Backup storage is ephemeral (emptyDir) — backups are lost when pod terminates
+    - No off-site backup replication configured
+    - Disk space monitoring not configured for backup volume
 
     ### Contacts
     - Platform team: #platform-eng on Mattermost
-    - On-call: See PagerDuty rotation
 EOF
 
 ###############################################
 # STRIP ANNOTATIONS
 ###############################################
 kubectl annotate configmap/glitchtip-backup-script -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
-kubectl annotate configmap/glitchtip-migration-log -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
-kubectl annotate configmap/glitchtip-dr-runbook -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+kubectl annotate configmap/glitchtip-dr-incident-2024q3 -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+kubectl annotate configmap/glitchtip-backup-status -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate cronjob/glitchtip-backup -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate secret/glitchtip-backup-minio-creds -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate networkpolicy/glitchtip-minio-access-policy -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
