@@ -10,7 +10,7 @@ kubectl get configmap glitchtip-backup-runtime-original -n glitchtip >/dev/null
 kubectl get cronjob glitchtip-backup-template-manager -n glitchtip >/dev/null
 
 echo "[solution] Current incident: both the backup script and the backup runtime identity are reconciled through compliance baselines."
-echo "[solution] Writing a replacement script that performs exact set validation and reports the latest run state."
+echo "[solution] Writing a replacement script that performs exact set and content-integrity validation and reports the latest run state."
 
 cat > /tmp/glitchtip-backup-fixed.sh <<'SCRIPT_EOF'
 #!/bin/bash
@@ -29,6 +29,7 @@ DB_FILEBLOB_COUNT=0
 MIRRORED_OBJECT_COUNT=0
 MISSING_COUNT=0
 EXTRA_COUNT=0
+INTEGRITY_MISMATCH_COUNT=0
 PG_DUMP_STATUS="not-started"
 
 json_escape() {
@@ -59,6 +60,7 @@ ${STATUS_DETAILS}
 - Mirrored object count: ${MIRRORED_OBJECT_COUNT}
 - Missing objects: ${MISSING_COUNT}
 - Extra objects: ${EXTRA_COUNT}
+- Integrity mismatches: ${INTEGRITY_MISMATCH_COUNT}
 EOF
 )
 
@@ -108,13 +110,14 @@ mc alias set backup "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KE
 mc mirror --overwrite "backup/${MINIO_BUCKET}" "${BACKUP_DIR}/minio-data" 2>&1
 
 CURRENT_STEP="build-expected-sets"
-PGPASSWORD="${PGPASSWORD}" psql -h glitchtip-postgresql -U postgres -d postgres -tAc \
-  "SELECT blob FROM files_fileblob WHERE blob IS NOT NULL ORDER BY blob;" \
-  | sed '/^[[:space:]]*$/d' | sort -u > "${BACKUP_DIR}/db-keys.txt"
+PGPASSWORD="${PGPASSWORD}" psql -h glitchtip-postgresql -U postgres -d postgres -At -F $'\t' \
+  -c "SELECT blob, size, checksum FROM files_fileblob WHERE blob IS NOT NULL ORDER BY blob;" \
+  | sed '/^[[:space:]]*$/d' > "${BACKUP_DIR}/db-metadata.tsv"
 
-mc ls --recursive "backup/${MINIO_BUCKET}" 2>/dev/null \
-  | awk '{print $NF}' \
-  | sed "s#^backup/${MINIO_BUCKET}/##" \
+cut -f1 "${BACKUP_DIR}/db-metadata.tsv" | sed '/^[[:space:]]*$/d' | sort -u > "${BACKUP_DIR}/db-keys.txt"
+
+find "${BACKUP_DIR}/minio-data" -type f \
+  | sed "s#^${BACKUP_DIR}/minio-data/##" \
   | sed '/^[[:space:]]*$/d' | sort -u > "${BACKUP_DIR}/object-keys.txt"
 
 DB_FILEBLOB_COUNT=$(wc -l < "${BACKUP_DIR}/db-keys.txt" | tr -d '[:space:]')
@@ -140,16 +143,42 @@ if [ "${EXTRA_COUNT}" -gt 0 ]; then
   echo "[backup] Validation detail: object storage has extra objects with no database record: ${EXTRA_SAMPLE}"
 fi
 
-if [ "${MISSING_COUNT}" -gt 0 ] || [ "${EXTRA_COUNT}" -gt 0 ]; then
+CURRENT_STEP="validate-content-integrity"
+echo "[backup] Step 4/5: Validating mirrored object content integrity..."
+: > "${BACKUP_DIR}/integrity-mismatches.txt"
+
+while IFS=$'\t' read -r blob expected_size expected_checksum; do
+  [ -z "${blob}" ] && continue
+  object_path="${BACKUP_DIR}/minio-data/${blob}"
+  if [ ! -f "${object_path}" ]; then
+    continue
+  fi
+
+  actual_size=$(wc -c < "${object_path}" | tr -d '[:space:]')
+  actual_checksum=$(sha256sum "${object_path}" | awk '{print $1}')
+  if [ "${actual_size}" != "${expected_size}" ] || [ "${actual_checksum}" != "${expected_checksum}" ]; then
+    echo "${blob} checksum mismatch expected=${expected_checksum} actual=${actual_checksum} size_expected=${expected_size} size_actual=${actual_size}" >> "${BACKUP_DIR}/integrity-mismatches.txt"
+  fi
+done < "${BACKUP_DIR}/db-metadata.tsv"
+
+INTEGRITY_MISMATCH_COUNT=$(wc -l < "${BACKUP_DIR}/integrity-mismatches.txt" | tr -d '[:space:]')
+
+if [ "${INTEGRITY_MISMATCH_COUNT}" -gt 0 ]; then
+  INTEGRITY_SAMPLE=$(head -3 "${BACKUP_DIR}/integrity-mismatches.txt" | paste -sd ';' -)
+  echo "[backup] Validation detail: integrity mismatches in mirrored content: ${INTEGRITY_SAMPLE}"
+fi
+
+if [ "${MISSING_COUNT}" -gt 0 ] || [ "${EXTRA_COUNT}" -gt 0 ] || [ "${INTEGRITY_MISMATCH_COUNT}" -gt 0 ]; then
   fail_backup "- Set drift detected
 - missing_in_object_storage=${MISSING_COUNT}
 - extra_in_object_storage=${EXTRA_COUNT}
+- integrity_mismatches=${INTEGRITY_MISMATCH_COUNT}
 - pg_fileblobs=${DB_FILEBLOB_COUNT}
 - mirrored_objects=${MIRRORED_OBJECT_COUNT}"
 fi
 
 CURRENT_STEP="record-manifest"
-echo "[backup] Step 4/4: Recording backup metadata..."
+echo "[backup] Step 5/5: Recording backup metadata..."
 cat > "${BACKUP_DIR}/backup_manifest.txt" <<EOF
 timestamp=${TIMESTAMP}
 pg_dump=success
@@ -157,19 +186,21 @@ pg_fileblobs=${DB_FILEBLOB_COUNT}
 mirrored_objects=${MIRRORED_OBJECT_COUNT}
 missing_in_object_storage=${MISSING_COUNT}
 extra_in_object_storage=${EXTRA_COUNT}
-validation=exact-set-match
+integrity_mismatches=${INTEGRITY_MISMATCH_COUNT}
+validation=exact-set-and-integrity-match
 EOF
 
 RUN_STATUS="SUCCESS"
 STATUS_DETAILS="- PostgreSQL dump: success
-- Validation: exact set comparison passed
+- Validation: exact set and content-integrity comparison passed
 - pg_fileblobs=${DB_FILEBLOB_COUNT}
 - mirrored_objects=${MIRRORED_OBJECT_COUNT}
 - missing_in_object_storage=0
-- extra_in_object_storage=0"
+- extra_in_object_storage=0
+- integrity_mismatches=0"
 report_status
 
-echo "[backup] Validation passed: exact database/object-store sets match"
+echo "[backup] Validation passed: exact database/object-store sets and object bytes match"
 echo "[backup] Backup complete."
 SCRIPT_EOF
 

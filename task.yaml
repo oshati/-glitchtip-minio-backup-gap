@@ -13,7 +13,8 @@ prompt: |
   The restore issues were not all the same. In some cases data that should have
   been there was missing, in some cases storage still contained content that no
   longer lined up with the application state, and in a few cases the totals
-  looked normal even though the recovered contents were still wrong.
+  looked normal even though the recovered contents were still wrong. Some of the
+  bad restores had the right object names but the wrong bytes behind them.
 
   Investigate the existing backup flow in the `glitchtip` namespace and make it
   trustworthy again. A healthy run should still complete. A bad run should stop
@@ -35,6 +36,9 @@ prompt: |
   or removing surrounding controls just to force a green backup. The backup job
   only needs enough runtime access to publish its run note; it should not end up
   with broad maintenance access that can rewrite its own backup configuration.
+  Do not rewrite the current attachment bucket or database rows just to make the
+  drill pass; the point is to make the backup path tell the truth about the
+  state it sees today, not to clean up that state by hand.
 
 metadata:
   category: platform-eng

@@ -13,14 +13,13 @@ Objectives:
 2. clean_run_proves_real_backup_artifacts
    - A clean run must show evidence that a real dump and object capture were
      produced, not just that validation passed.
-3. validation_catches_forward_gap
-   - A database record with no matching object must fail closed and be reported.
-4. validation_catches_reverse_gap
-   - An object with no matching database record must fail closed and be reported.
-5. validation_catches_balanced_set_drift
-   - Equal counts but mismatched sets must still fail closed and be reported.
+3. validation_catches_all_drift_modes
+   - Forward gap, reverse gap, equal-count set drift, and wrong-bytes integrity
+     drift must all fail closed and be reported. Partial drift handling does
+     not get separate credit.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -66,6 +65,18 @@ def load_setup_info():
     except FileNotFoundError:
         pass
     return info
+
+
+def sha256_text(value):
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def byte_count(value):
+    return len(value.encode("utf-8"))
+
+
+def sql_escape(value):
+    return value.replace("'", "''")
 
 
 def get_pg_pod():
@@ -186,6 +197,58 @@ def set_status_doc(text):
     return rc == 0, err
 
 
+def minio_object_exists(minio_pod, bucket, object_key, setup_info):
+    rc, _, _ = minio_exec(
+        minio_pod,
+        f"mc stat local/{bucket}/{object_key} >/dev/null 2>&1",
+        setup_info,
+    )
+    return rc == 0
+
+
+def minio_get_object_content(minio_pod, bucket, object_key, setup_info):
+    rc, out, err = minio_exec(
+        minio_pod,
+        f"mc cat local/{bucket}/{object_key}",
+        setup_info,
+    )
+    return rc == 0, out, err
+
+
+def minio_put_object_content(minio_pod, bucket, object_key, content, setup_info):
+    return minio_exec(
+        minio_pod,
+        f"printf '%s' '{content}' | mc pipe local/{bucket}/{object_key} >/dev/null 2>&1",
+        setup_info,
+    )
+
+
+def ensure_fileblob_row(pg_pod, blob_path, content, setup_info):
+    checksum = sha256_text(content)
+    size = byte_count(content)
+    blob_sql = sql_escape(blob_path)
+    checksum_sql = sql_escape(checksum)
+    pg_sql(
+        pg_pod,
+        " ".join([
+            f"UPDATE files_fileblob SET checksum = '{checksum_sql}', size = {size}, created = NOW()",
+            f"WHERE blob = '{blob_sql}';",
+            "INSERT INTO files_fileblob (created, checksum, size, blob)",
+            f"SELECT NOW(), '{checksum_sql}', {size}, '{blob_sql}'",
+            f"WHERE NOT EXISTS (SELECT 1 FROM files_fileblob WHERE blob = '{blob_sql}');",
+        ]),
+        setup_info,
+    )
+
+
+def remove_fileblob_rows(pg_pod, blob_path, setup_info):
+    pg_sql(
+        pg_pod,
+        f"DELETE FROM files_fileblob WHERE blob = '{sql_escape(blob_path)}';",
+        setup_info,
+    )
+
+
 def wait_for_status_change(marker, timeout_seconds=60):
     for _ in range(int(timeout_seconds / 5)):
         current = get_status_doc()
@@ -219,14 +282,20 @@ def ensure_consistent_dataset(setup_info):
 
     bucket = setup_info.get("MINIO_BUCKET", "glitchtip-attachments")
     live_missing = setup_info.get("LIVE_MISSING_BLOB", "")
+    live_missing_content = setup_info.get("LIVE_MISSING_CONTENT", "restored-live-baseline-object")
     live_stale = setup_info.get("LIVE_STALE_BLOB", "")
+    integrity_target = setup_info.get("INTEGRITY_TARGET_BLOB", "")
+    integrity_target_content = setup_info.get("INTEGRITY_TARGET_CONTENT", "")
 
     if live_missing:
-        minio_exec(
+        minio_put_object_content(
             minio_pod,
-            f"echo 'restored-live-baseline-object' | mc pipe local/{bucket}/{live_missing} >/dev/null 2>&1",
+            bucket,
+            live_missing,
+            live_missing_content,
             setup_info,
         )
+        ensure_fileblob_row(pg_pod, live_missing, live_missing_content, setup_info)
 
     if live_stale:
         minio_exec(
@@ -234,6 +303,17 @@ def ensure_consistent_dataset(setup_info):
             f"mc rm --force local/{bucket}/{live_stale} >/dev/null 2>&1 || true",
             setup_info,
         )
+        remove_fileblob_rows(pg_pod, live_stale, setup_info)
+
+    if integrity_target and integrity_target_content:
+        minio_put_object_content(
+            minio_pod,
+            bucket,
+            integrity_target,
+            integrity_target_content,
+            setup_info,
+        )
+        ensure_fileblob_row(pg_pod, integrity_target, integrity_target_content, setup_info)
 
     minio_exec(
         minio_pod,
@@ -251,14 +331,18 @@ def ensure_consistent_dataset(setup_info):
 
 
 def restore_live_drift(setup_info):
-    pg_pod = get_pg_pod()
+    ok, message = ensure_consistent_dataset(setup_info)
+    if not ok:
+        return False, message
+
     minio_pod = get_minio_pod()
-    if not pg_pod or not minio_pod:
-        return False, "Could not locate PostgreSQL or MinIO pod"
+    if not minio_pod:
+        return False, "Could not locate MinIO pod"
 
     bucket = setup_info.get("MINIO_BUCKET", "glitchtip-attachments")
     live_missing = setup_info.get("LIVE_MISSING_BLOB", "")
     live_stale = setup_info.get("LIVE_STALE_BLOB", "")
+    live_stale_content = setup_info.get("LIVE_STALE_CONTENT", "live-object-store-leftover")
 
     if live_missing:
         minio_exec(
@@ -268,13 +352,108 @@ def restore_live_drift(setup_info):
         )
 
     if live_stale:
-        minio_exec(
+        minio_put_object_content(
             minio_pod,
-            f"echo 'live-object-store-leftover' | mc pipe local/{bucket}/{live_stale} >/dev/null 2>&1",
+            bucket,
+            live_stale,
+            live_stale_content,
             setup_info,
         )
 
     return True, "Live drift restored"
+
+
+def verify_live_incident_untouched(setup_info):
+    pg_pod = get_pg_pod()
+    minio_pod = get_minio_pod()
+    if not pg_pod or not minio_pod:
+        return False, "Could not locate PostgreSQL or MinIO pod to verify the live incident state"
+
+    bucket = setup_info.get("MINIO_BUCKET", "glitchtip-attachments")
+    live_missing = setup_info.get("LIVE_MISSING_BLOB", "")
+    live_missing_content = setup_info.get("LIVE_MISSING_CONTENT", "")
+    live_stale = setup_info.get("LIVE_STALE_BLOB", "")
+    live_stale_content = setup_info.get("LIVE_STALE_CONTENT", "")
+    integrity_target = setup_info.get("INTEGRITY_TARGET_BLOB", "")
+    integrity_target_content = setup_info.get("INTEGRITY_TARGET_CONTENT", "")
+
+    def row_summary(blob_path):
+        return pg_sql(
+            pg_pod,
+            " ".join([
+                "SELECT COALESCE(checksum, '') || '|' || COALESCE(size::text, '')",
+                "FROM files_fileblob",
+                f"WHERE blob = '{sql_escape(blob_path)}'",
+                "ORDER BY id DESC LIMIT 1;",
+            ]),
+            setup_info,
+        )
+
+    def row_count(blob_path):
+        count = pg_sql(
+            pg_pod,
+            f"SELECT COUNT(*) FROM files_fileblob WHERE blob = '{sql_escape(blob_path)}';",
+            setup_info,
+        )
+        try:
+            return int(count or "0")
+        except ValueError:
+            return 0
+
+    if live_missing:
+        expected_missing_summary = f"{sha256_text(live_missing_content)}|{byte_count(live_missing_content)}"
+        if row_summary(live_missing) != expected_missing_summary:
+            return False, (
+                "The live incident was altered: the database metadata for the known missing object "
+                f"'{live_missing}' no longer matches the original drill state."
+            )
+        if minio_object_exists(minio_pod, bucket, live_missing, setup_info):
+            return False, (
+                "The live incident was altered: the originally missing object "
+                f"'{live_missing}' was written back into MinIO instead of being detected by the backup."
+            )
+
+    if live_stale:
+        if row_count(live_stale) != 0:
+            return False, (
+                "The live incident was altered: the object-store-only leftover "
+                f"'{live_stale}' was added to the database metadata."
+            )
+        exists, content, _ = minio_get_object_content(minio_pod, bucket, live_stale, setup_info)
+        if not exists:
+            return False, (
+                "The live incident was altered: the object-store-only leftover "
+                f"'{live_stale}' was removed from MinIO instead of being reported."
+            )
+        if content != live_stale_content:
+            return False, (
+                "The live incident was altered: the object-store-only leftover "
+                f"'{live_stale}' no longer has its original drill content."
+            )
+
+    if integrity_target:
+        expected_integrity_summary = f"{sha256_text(integrity_target_content)}|{byte_count(integrity_target_content)}"
+        if row_summary(integrity_target) != expected_integrity_summary:
+            return False, (
+                "The live incident was altered: the database metadata for the known integrity-check "
+                f"object '{integrity_target}' no longer matches the original drill state."
+            )
+        exists, content, _ = minio_get_object_content(minio_pod, bucket, integrity_target, setup_info)
+        if not exists:
+            return False, (
+                "The live incident was altered: the known integrity-check object "
+                f"'{integrity_target}' disappeared from MinIO."
+            )
+        if content != integrity_target_content:
+            return False, (
+                "The live incident was altered: the known integrity-check object "
+                f"'{integrity_target}' was rewritten instead of being backed up and verified as-is."
+            )
+
+    return True, (
+        "The live incident data still matches the original drill state; the repair did not rewrite "
+        "production evidence to force a green run."
+    )
 
 
 def record_text(logs, status_doc):
@@ -300,6 +479,11 @@ def extract_relevant_excerpt(text, expected_path="", window=6, fallback_lines=12
             "missing",
             "orphan",
             "extra",
+            "integrity",
+            "checksum",
+            "sha256",
+            "hash",
+            "corrupt",
             "result:",
             "status configmap",
             "tracked",
@@ -372,6 +556,24 @@ def evidence_for_reverse_gap(text, expected_path):
     ]
 
     return has_path_with_context_patterns(text, expected_path, reverse_patterns)
+
+
+def evidence_for_integrity_mismatch(text, expected_path):
+    integrity_patterns = [
+        r"integrity mismatch",
+        r"checksum mismatch",
+        r"hash mismatch",
+        r"sha256 mismatch",
+        r"digest mismatch",
+        r"content mismatch",
+        r"wrong bytes",
+        r"corrupt(?:ed|ion)?",
+        r"size mismatch",
+        r"mismatch(?:es)? in mirrored content",
+        r"integrity_mismatch",
+    ]
+
+    return has_path_with_context_patterns(text, expected_path, integrity_patterns)
 
 
 def verify_minio_access_remains_scoped(setup_info):
@@ -844,24 +1046,119 @@ def check_validation_catches_balanced_set_drift(setup_info):
     return 1.0, "Validation catches equal-count set drift instead of relying on simple totals"
 
 
+def check_validation_catches_integrity_drift(setup_info):
+    ok, message = ensure_consistent_dataset(setup_info)
+    if not ok:
+        return 0.0, message
+
+    minio_pod = get_minio_pod()
+    if not minio_pod:
+        return 0.0, "No MinIO pod found"
+
+    bucket = setup_info.get("MINIO_BUCKET", "glitchtip-attachments")
+    target_key = setup_info.get("INTEGRITY_TARGET_BLOB", "")
+    corrupted_content = setup_info.get("INTEGRITY_CORRUPTED_CONTENT", "")
+    if not target_key or not corrupted_content:
+        return 0.0, "Integrity drift fixtures are missing from setup"
+
+    minio_put_object_content(
+        minio_pod,
+        bucket,
+        target_key,
+        corrupted_content,
+        setup_info,
+    )
+
+    ts = int(time.time())
+    marker = f"GRADER-INT-{ts}"
+    set_status_doc(marker)
+
+    job_name = f"grader-integrity-{ts}"
+    completed, logs, failed, err = trigger_backup_job(job_name)
+    status_doc = wait_for_status_change(marker)
+    cleanup_job(job_name)
+    ensure_consistent_dataset(setup_info)
+
+    job_failed = failed.isdigit() and int(failed) > 0
+    text = record_text(logs, status_doc)
+
+    if err:
+        return 0.0, err
+    if not job_failed:
+        return 0.0, f"Integrity drift did not fail closed. Logs:\n{extract_relevant_excerpt(logs, target_key)}"
+    if not status_doc or marker in status_doc or not status_has_failure(status_doc):
+        return 0.0, f"Integrity drift run did not publish a failed status. Status: {status_doc[:300]}"
+    if not evidence_for_integrity_mismatch(text, target_key):
+        return 0.0, (
+            "Integrity drift run did not report corrupted mirrored content. "
+            f"Relevant excerpt:\n{extract_relevant_excerpt(text, target_key)}"
+        )
+    runtime_ok, runtime_feedback = verify_backup_runtime_permissions_remain_scoped()
+    if not runtime_ok:
+        return 0.0, runtime_feedback
+
+    return 1.0, "Validation fails closed when an object key exists but its mirrored bytes do not match the database metadata"
+
+
+def check_validation_catches_all_drift_modes(setup_info):
+    scenarios = [
+        ("forward gap", check_validation_catches_forward_gap),
+        ("reverse gap", check_validation_catches_reverse_gap),
+        ("balanced set drift", check_validation_catches_balanced_set_drift),
+        ("integrity drift", check_validation_catches_integrity_drift),
+    ]
+
+    feedback_parts = []
+    for label, check_fn in scenarios:
+        score, feedback = check_fn(setup_info)
+        feedback_parts.append(f"{label}: {feedback}")
+        if score <= 0:
+            return 0.0, (
+                "Validation does not handle every required drift mode. "
+                + " | ".join(feedback_parts)
+            )
+
+    return 1.0, (
+        "Validation fails closed and reports forward gaps, reverse gaps, "
+        "equal-count set drift, and wrong-bytes integrity drift within the same backup design"
+    )
+
+
 def grade(*args, **kwargs) -> GradingResult:
     os.environ["KUBECONFIG"] = "/etc/rancher/k3s/k3s.yaml"
     setup_info = load_setup_info()
+
+    checks = {
+        "pipeline_handles_clean_and_drift_runs": check_pipeline_handles_clean_and_drift_runs,
+        "clean_run_proves_real_backup_artifacts": check_clean_run_proves_real_backup_artifacts,
+        "validation_catches_all_drift_modes": check_validation_catches_all_drift_modes,
+    }
+    weight = 1.0 / len(checks)
 
     run_cmd("pkill -u ubuntu 2>/dev/null || true")
 
     print("[grader] Waiting 240s durability window...")
     time.sleep(240)
 
-    checks = {
-        "pipeline_handles_clean_and_drift_runs": check_pipeline_handles_clean_and_drift_runs,
-        "clean_run_proves_real_backup_artifacts": check_clean_run_proves_real_backup_artifacts,
-        "validation_catches_forward_gap": check_validation_catches_forward_gap,
-        "validation_catches_reverse_gap": check_validation_catches_reverse_gap,
-        "validation_catches_balanced_set_drift": check_validation_catches_balanced_set_drift,
-    }
+    incident_ok, incident_feedback = verify_live_incident_untouched(setup_info)
+    if not incident_ok:
+        subscores = {name: 0.0 for name in checks}
+        weights = {name: weight for name in checks}
+        feedback_str = (
+            "[live_incident_untouched] FAIL: "
+            + incident_feedback
+            + "\nThe task explicitly forbids rewriting the current attachment bucket or database rows "
+              "just to force a green drill."
+        )
+        print(f"[grader] live_incident_untouched: 0.0 — {incident_feedback}")
+        print("\n[grader] Final score: 0.0000")
+        return GradingResult(
+            score=0.0,
+            subscores=subscores,
+            weights=weights,
+            feedback=feedback_str,
+        )
 
-    weight = 1.0 / len(checks)
     subscores = {}
     weights = {}
     feedback_parts = []

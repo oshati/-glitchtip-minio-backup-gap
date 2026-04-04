@@ -198,23 +198,67 @@ done
 ###############################################
 echo "[setup] Creating attachment bucket and sample files..."
 
+LIVE_MISSING_BLOB="attachments/event_3/crash_report_3.dmp"
+LIVE_STALE_BLOB="attachments/drift/live_extra_trace.bin"
+INTEGRITY_TARGET_BLOB="attachments/event_6/crash_report_6.dmp"
+
+randhex() {
+  head -c 32 /dev/urandom | od -A n -t x1 | tr -d ' \n'
+}
+
+seed_blob_and_metadata() {
+  local blob_path="$1"
+  local content="$2"
+  local size checksum
+
+  size=$(printf "%s" "${content}" | wc -c | tr -d '[:space:]')
+  checksum=$(printf "%s" "${content}" | sha256sum | awk '{print $1}')
+
+  kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "
+    printf '%s' '${content}' | mc pipe local/${MINIO_BUCKET}/${blob_path} >/dev/null 2>&1
+  " 2>/dev/null
+
+  gt_sql "INSERT INTO files_fileblob (created, checksum, size, blob)
+    VALUES (NOW(), '${checksum}', ${size}, '${blob_path}')
+    ON CONFLICT (checksum) DO NOTHING;"
+}
+
 MINIO_POD=$(kubectl get pods -n glitchtip -l app=glitchtip-minio -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "
 mc alias set local http://localhost:9000 '${MINIO_ACCESS_KEY}' '${MINIO_SECRET_KEY}' >/dev/null 2>&1
 mc mb local/${MINIO_BUCKET} 2>/dev/null || true
 " 2>&1
 
+LIVE_MISSING_CONTENT=""
+LIVE_STALE_CONTENT="stale$(randhex)"
+INTEGRITY_TARGET_CONTENT=""
+INTEGRITY_CORRUPTED_CONTENT="corrupt$(randhex)"
+
 for i in $(seq 1 10); do
-  kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "
-    echo 'crash-report-data-event-${i}' | mc pipe local/${MINIO_BUCKET}/attachments/event_${i}/crash_report_${i}.dmp 2>/dev/null
-    echo 'source-map-service-${i}' | mc pipe local/${MINIO_BUCKET}/attachments/event_${i}/sourcemap_${i}.js.map 2>/dev/null
-  " 2>/dev/null
+  CRASH_PATH="attachments/event_${i}/crash_report_${i}.dmp"
+  SOURCE_PATH="attachments/event_${i}/sourcemap_${i}.js.map"
+  CRASH_CONTENT="crash$(randhex)"
+  SOURCE_CONTENT="smap$(randhex)"
+
+  if [ "${CRASH_PATH}" = "${LIVE_MISSING_BLOB}" ]; then
+    LIVE_MISSING_CONTENT="${CRASH_CONTENT}"
+  fi
+
+  if [ "${CRASH_PATH}" = "${INTEGRITY_TARGET_BLOB}" ]; then
+    INTEGRITY_TARGET_CONTENT="${CRASH_CONTENT}"
+    while [ "${INTEGRITY_CORRUPTED_CONTENT}" = "${INTEGRITY_TARGET_CONTENT}" ]; do
+      INTEGRITY_CORRUPTED_CONTENT="corrupt$(randhex)"
+    done
+  fi
+
+  seed_blob_and_metadata "${CRASH_PATH}" "${CRASH_CONTENT}"
+  seed_blob_and_metadata "${SOURCE_PATH}" "${SOURCE_CONTENT}"
 done
 
 for i in $(seq 1 5); do
-  kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "
-    echo 'debug-symbol-dsym-${i}' | mc pipe local/${MINIO_BUCKET}/debug-symbols/dsym_${i}.dSYM 2>/dev/null
-  " 2>/dev/null
+  DSYM_PATH="debug-symbols/dsym_${i}.dSYM"
+  DSYM_CONTENT="dsym$(randhex)"
+  seed_blob_and_metadata "${DSYM_PATH}" "${DSYM_CONTENT}"
 done
 
 # Verify
@@ -222,25 +266,9 @@ OBJ_COUNT=$(kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "mc ls --recursive
 echo "[setup] MinIO objects created: ${OBJ_COUNT}"
 
 ###############################################
-# INSERT ATTACHMENT METADATA IN POSTGRESQL
+# INSERT FILE RECORDS IN POSTGRESQL
 ###############################################
-echo "[setup] Inserting attachment metadata in PostgreSQL..."
-
-# Create fileblob records pointing to MinIO paths
-for i in $(seq 1 10); do
-  gt_sql "INSERT INTO files_fileblob (created, checksum, size, blob)
-    VALUES (NOW(), 'sha1_crash_${i}_$(head -c 8 /dev/urandom | od -A n -t x1 | tr -d ' \n')', 4096, 'attachments/event_${i}/crash_report_${i}.dmp')
-    ON CONFLICT (checksum) DO NOTHING;"
-  gt_sql "INSERT INTO files_fileblob (created, checksum, size, blob)
-    VALUES (NOW(), 'sha1_smap_${i}_$(head -c 8 /dev/urandom | od -A n -t x1 | tr -d ' \n')', 2048, 'attachments/event_${i}/sourcemap_${i}.js.map')
-    ON CONFLICT (checksum) DO NOTHING;"
-done
-
-for i in $(seq 1 5); do
-  gt_sql "INSERT INTO files_fileblob (created, checksum, size, blob)
-    VALUES (NOW(), 'sha1_dsym_${i}_$(head -c 8 /dev/urandom | od -A n -t x1 | tr -d ' \n')', 8192, 'debug-symbols/dsym_${i}.dSYM')
-    ON CONFLICT (checksum) DO NOTHING;"
-done
+echo "[setup] Inserting attachment records in PostgreSQL..."
 
 # Create file records referencing the blobs
 BLOB_IDS=$(gt_sql "SELECT id FROM files_fileblob ORDER BY id DESC LIMIT 25;")
@@ -259,14 +287,11 @@ echo "[setup] Created ${TOTAL_BLOBS} fileblob records in PostgreSQL."
 # extra object exists only in MinIO. Counts still
 # match, so naive validation can report success.
 ###############################################
-LIVE_MISSING_BLOB="attachments/event_3/crash_report_3.dmp"
-LIVE_STALE_BLOB="attachments/drift/live_extra_trace.bin"
-
 echo "[setup] Injecting balanced attachment drift..."
 kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "
 mc alias set local http://localhost:9000 '${MINIO_ACCESS_KEY}' '${MINIO_SECRET_KEY}' >/dev/null 2>&1
 mc rm --force local/${MINIO_BUCKET}/${LIVE_MISSING_BLOB} >/dev/null 2>&1 || true
-echo 'live-extra-object-without-db-record' | mc pipe local/${MINIO_BUCKET}/${LIVE_STALE_BLOB} >/dev/null 2>&1
+printf '%s' '${LIVE_STALE_CONTENT}' | mc pipe local/${MINIO_BUCKET}/${LIVE_STALE_BLOB} >/dev/null 2>&1
 " 2>/dev/null
 
 OBJ_COUNT=$(kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "mc ls --recursive local/${MINIO_BUCKET}/ 2>/dev/null | wc -l")
@@ -754,7 +779,12 @@ MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
 MINIO_BUCKET=${MINIO_BUCKET}
 MINIO_ENDPOINT=http://glitchtip-minio:9000
 LIVE_MISSING_BLOB=${LIVE_MISSING_BLOB}
+LIVE_MISSING_CONTENT=${LIVE_MISSING_CONTENT}
 LIVE_STALE_BLOB=${LIVE_STALE_BLOB}
+LIVE_STALE_CONTENT=${LIVE_STALE_CONTENT}
+INTEGRITY_TARGET_BLOB=${INTEGRITY_TARGET_BLOB}
+INTEGRITY_TARGET_CONTENT=${INTEGRITY_TARGET_CONTENT}
+INTEGRITY_CORRUPTED_CONTENT=${INTEGRITY_CORRUPTED_CONTENT}
 SETUP_EOF
 chmod 600 /root/.setup_info
 
