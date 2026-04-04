@@ -1,28 +1,29 @@
 id: null
 prompt: |
-  The platform team just ran a quarterly disaster recovery drill for GlitchTip.
-  They restored from the most recent PostgreSQL backup into the existing namespace
-  and everything looked fine at first — issues loaded, projects were visible, alert
-  rules were intact.
+  The platform team reran a quarterly disaster recovery drill for GlitchTip.
+  The latest backup note in-cluster still says the pipeline is healthy, but the
+  restore told a different story: issue detail pages with file attachments had
+  broken links, and a few symbolicated traces came back incomplete.
 
-  But then engineers started reporting that issue detail pages for events with file
-  attachments show broken links, and stack traces for a few services are incomplete.
-  Someone mentioned GlitchTip was migrated to use MinIO for attachment storage about
-  six months ago, but nobody is sure if the backup pipeline was updated to account for
-  that.
+  GlitchTip is still running in the existing namespace with PostgreSQL and
+  S3-compatible object storage. Someone already touched the backup pipeline a
+  while ago, so this is not just a missing `pg_dump` problem. Trace how the
+  attachment metadata and the object store line up, figure out why the backup
+  can still look green while restored data is wrong, and harden the pipeline so
+  it fails closed when those two sources drift.
 
-  The backup runs as a Kubernetes CronJob somewhere in the cluster. Can you trace
-  the attachment storage path, figure out why the restored data is incomplete, and
-  fix the backup pipeline so this doesn't happen again? There should also be some
-  kind of validation step that catches this sort of gap before it becomes a problem.
+  A clean backup run should still be able to complete, but mismatches must be
+  caught before the next drill. That includes records that point at missing
+  objects, leftover objects that no current record references, and cases where
+  simple totals still look fine even though the actual sets do not match.
 
-  Also, when we had that TLS incident last quarter, nobody knew the backup had
-  failed until the DR drill. The backup pipeline should report its status
-  somewhere persistent so the on-call team can tell if a run failed without
-  having to dig through pod logs.
+  There is already a persistent status surface for the backup pipeline in the
+  cluster, but it is stale and not trustworthy. Update the pipeline so the
+  latest run state is written there clearly enough for on-call to tell whether
+  a run succeeded or failed without digging through pod logs.
 
-  The MinIO and GlitchTip credentials should be discoverable from the cluster
-  secrets and ConfigMaps.
+  The GlitchTip and object-storage details should be discoverable from the
+  cluster secrets and ConfigMaps.
 
 metadata:
   category: platform-eng

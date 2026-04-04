@@ -254,9 +254,31 @@ TOTAL_BLOBS=$(gt_sql "SELECT COUNT(*) FROM files_fileblob;")
 echo "[setup] Created ${TOTAL_BLOBS} fileblob records in PostgreSQL."
 
 ###############################################
-# CREATE BROKEN BACKUP CRONJOB (PostgreSQL only, NO MinIO)
+# INJECT LIVE BALANCED DRIFT
+# One DB-referenced object is missing and one
+# extra object exists only in MinIO. Counts still
+# match, so naive validation can report success.
 ###############################################
-echo "[setup] Creating backup CronJob (PostgreSQL only — missing MinIO)..."
+LIVE_MISSING_BLOB="attachments/event_3/crash_report_3.dmp"
+LIVE_STALE_BLOB="attachments/drift/live_extra_trace.bin"
+
+echo "[setup] Injecting balanced attachment drift..."
+kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "
+mc alias set local http://localhost:9000 '${MINIO_ACCESS_KEY}' '${MINIO_SECRET_KEY}' >/dev/null 2>&1
+mc rm --force local/${MINIO_BUCKET}/${LIVE_MISSING_BLOB} >/dev/null 2>&1 || true
+echo 'live-extra-object-without-db-record' | mc pipe local/${MINIO_BUCKET}/${LIVE_STALE_BLOB} >/dev/null 2>&1
+" 2>/dev/null
+
+OBJ_COUNT=$(kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "mc ls --recursive local/${MINIO_BUCKET}/ 2>/dev/null | wc -l")
+echo "[setup] Live object-store count after drift injection: ${OBJ_COUNT}"
+
+###############################################
+# CREATE PARTIALLY MIGRATED BACKUP CRONJOB
+# The pipeline mirrors MinIO and records counts,
+# but only validates total counts and does not
+# update the persistent status surface.
+###############################################
+echo "[setup] Creating partially migrated backup CronJob..."
 
 kubectl apply -f - <<'EOF'
 apiVersion: v1
@@ -267,23 +289,45 @@ metadata:
 data:
   backup.sh: |
     #!/bin/bash
-    set -e
+    set -euo pipefail
+    export PATH="/tools:${PATH}"
+    export MC_CONFIG_DIR="/tmp/.mc"
+    export HOME="/tmp"
+
     echo "[backup] Starting GlitchTip backup..."
     TIMESTAMP=$(date +%Y%m%d_%H%M%S)
     BACKUP_DIR="/backups/glitchtip-${TIMESTAMP}"
-    mkdir -p "${BACKUP_DIR}"
+    mkdir -p "${BACKUP_DIR}/minio-data"
 
     # Step 1: PostgreSQL dump
-    echo "[backup] Dumping PostgreSQL database..."
+    echo "[backup] Step 1/3: Dumping PostgreSQL database..."
     PGPASSWORD="${PGPASSWORD}" pg_dump -h glitchtip-postgresql -U postgres -d postgres \
       --format=custom --file="${BACKUP_DIR}/glitchtip_db.dump"
     echo "[backup] PostgreSQL dump complete: ${BACKUP_DIR}/glitchtip_db.dump"
 
-    # Step 2: Record backup metadata
+    # Step 2: Mirror object storage
+    echo "[backup] Step 2/3: Mirroring attachment object storage..."
+    mc alias set backup "${MINIO_ENDPOINT}" "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" --api S3v4 >/dev/null
+    mc mirror --overwrite "backup/${MINIO_BUCKET}" "${BACKUP_DIR}/minio-data" 2>&1
+
+    # Step 3: Count-based validation only
+    echo "[backup] Step 3/3: Running backup validation..."
+    PG_BLOB_COUNT=$(PGPASSWORD="${PGPASSWORD}" psql -h glitchtip-postgresql -U postgres -d postgres -tAc "SELECT COUNT(*) FROM files_fileblob;" | tr -d '[:space:]')
+    MINIO_OBJECT_COUNT=$(find "${BACKUP_DIR}/minio-data" -type f | wc -l | tr -d '[:space:]')
+    echo "[backup] Validation counts: pg_fileblobs=${PG_BLOB_COUNT}, mirrored_objects=${MINIO_OBJECT_COUNT}"
+
+    if [ "${PG_BLOB_COUNT}" != "${MINIO_OBJECT_COUNT}" ]; then
+      echo "[backup] VALIDATION FAILED: backup counts do not match"
+      exit 1
+    fi
+    echo "[backup] Validation passed: mirrored object count matches database fileblob count"
+
     echo "[backup] Recording backup metadata..."
     echo "timestamp=${TIMESTAMP}" > "${BACKUP_DIR}/backup_manifest.txt"
     echo "pg_dump=success" >> "${BACKUP_DIR}/backup_manifest.txt"
-    echo "pg_tables=$(PGPASSWORD="${PGPASSWORD}" psql -h glitchtip-postgresql -U postgres -d postgres -tAc "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public';")" >> "${BACKUP_DIR}/backup_manifest.txt"
+    echo "pg_fileblobs=${PG_BLOB_COUNT}" >> "${BACKUP_DIR}/backup_manifest.txt"
+    echo "mirrored_objects=${MINIO_OBJECT_COUNT}" >> "${BACKUP_DIR}/backup_manifest.txt"
+    echo "validation=count-match-only" >> "${BACKUP_DIR}/backup_manifest.txt"
 
     echo "[backup] Backup complete. Files:"
     ls -la "${BACKUP_DIR}/"
@@ -323,9 +367,25 @@ spec:
               defaultMode: 0755
           - name: backup-storage
             emptyDir: {}
+          - name: tools
+            emptyDir: {}
+          initContainers:
+          - name: copy-tools
+            image: docker.io/minio/minio:latest
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/sh
+            - -c
+            - |
+              cp /usr/bin/mc /tools/mc
+              cp /usr/bin/curl /tools/curl
+              chmod +x /tools/mc /tools/curl
+            volumeMounts:
+            - name: tools
+              mountPath: /tools
           containers:
           - name: backup
-            image: docker.io/library/postgres:16-alpine
+            image: docker.io/bitnamilegacy/postgresql:17.0.0-debian-12-r11
             imagePullPolicy: IfNotPresent
             command: ["/bin/bash", "/scripts/backup.sh"]
             volumeMounts:
@@ -333,48 +393,35 @@ spec:
               mountPath: /scripts
             - name: backup-storage
               mountPath: /backups
+            - name: tools
+              mountPath: /tools
             env:
             - name: PGPASSWORD
               valueFrom:
                 secretKeyRef:
                   name: glitchtip-postgresql
                   key: postgres-password
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: glitchtip-minio-creds
+                  key: MINIO_ACCESS_KEY
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: glitchtip-minio-creds
+                  key: MINIO_SECRET_KEY
+            - name: MINIO_ENDPOINT
+              value: "http://glitchtip-minio:9000"
+            - name: MINIO_BUCKET
+              value: "glitchtip-attachments"
 EOF
 
 ###############################################
-# BREAKAGE: CORRUPT MINIO CREDENTIALS FOR BACKUP
-# The glitchtip-minio-creds secret has the correct creds,
-# but create a SEPARATE backup-specific secret with WRONG creds
-# that the backup CronJob would use if the agent just copies
-# the pattern from the existing CronJob env vars.
+# ACCESS POLICY: KEEP MINIO SCOPED TO AUTHORIZED
+# WORKLOADS ONLY
 ###############################################
-echo "[setup] Creating corrupted backup MinIO credentials..."
-
-kubectl apply -f - <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: glitchtip-backup-minio-creds
-  namespace: glitchtip
-  labels:
-    app: glitchtip
-    component: backup
-  annotations:
-    description: "MinIO credentials for backup pipeline — rotated Q4 2024"
-type: Opaque
-stringData:
-  MINIO_ACCESS_KEY: "backup-service-account"
-  MINIO_SECRET_KEY: "rotated-key-expired-2024Q4"
-  MINIO_ENDPOINT: "http://glitchtip-minio:9000"
-  MINIO_BUCKET: "glitchtip-attachments"
-EOF
-
-###############################################
-# BREAKAGE: NETWORKPOLICY BLOCKING BACKUP PODS → MINIO
-# Backup pods (labeled job=backup) can't reach MinIO
-# unless the agent adds the right label or fixes the policy
-###############################################
-echo "[setup] Creating NetworkPolicy blocking backup pods from MinIO..."
+echo "[setup] Creating scoped NetworkPolicy for MinIO..."
 
 kubectl apply -f - <<'EOF'
 apiVersion: networking.k8s.io/v1
@@ -393,7 +440,7 @@ spec:
   policyTypes:
   - Ingress
   ingress:
-  # Allow from GlitchTip web pods only
+  # Allow from GlitchTip web pods
   - from:
     - podSelector:
         matchLabels:
@@ -401,12 +448,12 @@ spec:
     ports:
     - protocol: TCP
       port: 9000
-  # Allow from pods with the same app label (backup pods DON'T match)
+  # Allow from the backup pipeline only
   - from:
     - podSelector:
         matchLabels:
-          app.kubernetes.io/name: glitchtip
-          app.kubernetes.io/component: web
+          app: glitchtip
+          job: backup
     ports:
     - protocol: TCP
       port: 9000
@@ -414,8 +461,8 @@ EOF
 
 ###############################################
 # ENFORCER: CRONJOB THAT REVERTS BACKUP SCRIPT
-# Runs every 2 min, overwrites glitchtip-backup-script
-# ConfigMap back to PG-only version (removes agent's MinIO additions)
+# Runs every minute, overwrites glitchtip-backup-script
+# ConfigMap back to the approved count-based version.
 ###############################################
 echo "[setup] Creating backup script enforcer..."
 
@@ -471,7 +518,7 @@ metadata:
   annotations:
     description: "Manages backup script versioning and retention policy compliance"
 spec:
-  schedule: "*/2 * * * *"
+  schedule: "*/1 * * * *"
   successfulJobsHistoryLimit: 1
   failedJobsHistoryLimit: 1
   jobTemplate:
@@ -521,67 +568,6 @@ spec:
               name: glitchtip-backup-script-original
               optional: true
 EOF
-
-# Also create a Job-based enforcer (not a CronJob — invisible to kubectl get cronjobs)
-kubectl apply -f - <<'EOF'
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: glitchtip-backup-integrity-check
-  namespace: glitchtip
-  labels:
-    app: glitchtip
-    component: backup-integrity
-  annotations:
-    description: "Continuous backup script integrity verification"
-spec:
-  backoffLimit: 999
-  template:
-    metadata:
-      labels:
-        app: glitchtip
-        job: backup-integrity
-    spec:
-      restartPolicy: OnFailure
-      containers:
-      - name: checker
-        image: docker.io/bitnamilegacy/postgresql:17.0.0-debian-12-r11
-        imagePullPolicy: IfNotPresent
-        command:
-        - /bin/bash
-        - -c
-        - |
-          sleep 120
-          # Verify backup script hasn't been tampered with
-          echo "Integrity check cycle complete."
-          exit 1
-EOF
-
-###############################################
-# ADDITIONAL DECOY SECRET (third credential set)
-###############################################
-echo "[setup] Creating additional decoy credentials..."
-
-kubectl apply -f - <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: glitchtip-minio-backup-auth
-  namespace: glitchtip
-  labels:
-    app: glitchtip
-    component: backup
-  annotations:
-    description: "MinIO backup authentication — migrated from vault Q1 2025"
-type: Opaque
-stringData:
-  access-key: "vault-migrated-key"
-  secret-key: "vault-migrated-secret-2025"
-  endpoint: "http://glitchtip-minio:9000"
-  bucket: "glitchtip-attachments-archive"
-EOF
-
-# (secretRef patch already applied earlier, before object creation)
 
 ###############################################
 # MISLEADING DOCUMENTATION (no longer tells the agent the answer)
@@ -637,22 +623,28 @@ metadata:
 data:
   status.md: |
     # GlitchTip Backup Pipeline Status
-    ## Last Audit: January 2025
+    ## Latest Recorded Run: 2026-03-30T02:00:14Z
+
+    ### Reported Result
+    - Status: SUCCESS
+    - Backup ID: glitchtip-20260330_020014
+    - Validation summary: database fileblob count matched mirrored object count
 
     ### Current State
     - Backup CronJob: glitchtip-backup (runs daily at 2 AM)
-    - Backup type: PostgreSQL custom-format dump
+    - Backup type: PostgreSQL custom-format dump + MinIO mirror
+    - Validation mode: count comparison
     - Storage: emptyDir (backup files are ephemeral — not persisted to PVC)
     - Retention: 3 successful job history
 
     ### Recent Changes
     - Q4 2024: Fixed TLS certificate issue (see incident report)
-    - Q4 2024: Added backup manifest with table row counts
-    - Q1 2025: Upgraded to PostgreSQL 17 (note: backup container image
-      may need updating to match server version)
+    - Q4 2024: Added backup manifest with object counts
+    - Q1 2025: MinIO mirror step added to backup pipeline
 
     ### Known Issues
     - Backup storage is ephemeral (emptyDir) — backups are lost when pod terminates
+    - Status note is only as trustworthy as the backup validation step
     - No off-site backup replication configured
     - Disk space monitoring not configured for backup volume
 
@@ -669,10 +661,7 @@ kubectl annotate configmap/glitchtip-dr-incident-2024q3 -n glitchtip kubectl.kub
 kubectl annotate configmap/glitchtip-backup-status -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate cronjob/glitchtip-backup -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate cronjob/glitchtip-backup-retention-manager -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
-kubectl annotate job/glitchtip-backup-integrity-check -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate secret/glitchtip-minio-creds -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
-kubectl annotate secret/glitchtip-backup-minio-creds -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
-kubectl annotate secret/glitchtip-minio-backup-auth -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate networkpolicy/glitchtip-minio-access-policy -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 
 ###############################################
@@ -686,6 +675,8 @@ MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
 MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
 MINIO_BUCKET=${MINIO_BUCKET}
 MINIO_ENDPOINT=http://glitchtip-minio:9000
+LIVE_MISSING_BLOB=${LIVE_MISSING_BLOB}
+LIVE_STALE_BLOB=${LIVE_STALE_BLOB}
 SETUP_EOF
 chmod 600 /root/.setup_info
 
