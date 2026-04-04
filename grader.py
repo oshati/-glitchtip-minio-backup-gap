@@ -157,6 +157,15 @@ def get_status_doc():
     return out.strip("'") if rc == 0 else ""
 
 
+def get_backup_service_account():
+    rc, out, _ = run_cmd(
+        "kubectl get cronjob glitchtip-backup -n glitchtip "
+        "-o jsonpath='{.spec.jobTemplate.spec.template.spec.serviceAccountName}' 2>/dev/null",
+        timeout=20,
+    )
+    return out.strip("'") if rc == 0 else ""
+
+
 def set_status_doc(text):
     payload = json.dumps({"data": {STATUS_KEY: text}})
     rc, _, err = run_cmd(
@@ -433,6 +442,51 @@ EOF""",
     return True, "MinIO access remains scoped to authorized workloads after the backup fix"
 
 
+def verify_backup_runtime_permissions_remain_scoped():
+    sa_name = get_backup_service_account()
+    if not sa_name:
+        return False, (
+            "Backup CronJob does not declare a dedicated runtime identity. "
+            "The job should use a reconciled service account that can publish status without "
+            "having broad maintenance write access."
+        )
+
+    subject = f"system:serviceaccount:glitchtip:{sa_name}"
+
+    def can_i(verb, resource, resource_name):
+        rc, out, _ = run_cmd(
+            f"kubectl auth can-i --as={subject} {verb} {resource} "
+            f"--resource-name={resource_name} -n glitchtip",
+            timeout=20,
+        )
+        return rc == 0 and out.strip().lower() == "yes"
+
+    can_get_status = can_i("get", "configmaps", STATUS_CONFIGMAP)
+    can_patch_status = can_i("patch", "configmaps", STATUS_CONFIGMAP)
+    can_update_status = can_i("update", "configmaps", STATUS_CONFIGMAP)
+    can_patch_script = can_i("patch", "configmaps", "glitchtip-backup-script")
+    can_patch_original = can_i("patch", "configmaps", "glitchtip-backup-script-original")
+    can_patch_runtime_baseline = can_i("patch", "configmaps", "glitchtip-backup-runtime-original")
+    can_patch_backup_cronjob = can_i("patch", "cronjobs.batch", "glitchtip-backup")
+
+    if not can_get_status or not (can_patch_status or can_update_status):
+        return False, (
+            f"Backup runtime identity '{sa_name}' cannot publish the run-status note. "
+            "It needs narrow write access to the status ConfigMap."
+        )
+
+    if any([can_patch_script, can_patch_original, can_patch_runtime_baseline, can_patch_backup_cronjob]):
+        return False, (
+            f"Backup runtime identity '{sa_name}' is too broad. "
+            "It can rewrite backup configuration instead of only publishing status."
+        )
+
+    return True, (
+        f"Backup runtime identity '{sa_name}' can publish status without having broad "
+        "write access to the backup configuration."
+    )
+
+
 def check_clean_run_proves_real_backup_artifacts(setup_info):
     ok, message = ensure_consistent_dataset(setup_info)
     if not ok:
@@ -459,11 +513,15 @@ def check_clean_run_proves_real_backup_artifacts(setup_info):
         return 0.0, "Clean artifact-evidence run did not update the persistent status surface"
     if not status_has_success(status_doc):
         return 0.0, f"Clean artifact-evidence status does not indicate success. Status: {status_doc[:300]}"
+    runtime_ok, runtime_feedback = verify_backup_runtime_permissions_remain_scoped()
+    if not runtime_ok:
+        return 0.0, runtime_feedback
 
     has_dump_log = "glitchtip_db.dump" in logs_lower
     has_manifest_log = "backup_manifest.txt" in logs_lower or "recording backup metadata" in logs_lower
     backup_id_match = re.search(r"(?:backup id|backup_id)[^a-z0-9-]*(glitchtip-\d{8}_\d{6})", status_lower)
-    dump_status_ok = re.search(r"(?:postgresql dump|pg_dump)[^a-z0-9]*(?:success|ok|completed)", status_lower)
+    dump_status_ok = re.search(r"(?:postgresql dump|pg_dump|database dump)[^\n]*(?:success|ok|completed|\b\d+\s*bytes\b)", status_lower)
+    dump_size_match = re.search(r"(?:pg_dump size|database dump size|postgresql dump)[^0-9]*(\d+)\s*bytes", status_lower)
     db_count_match = re.search(r"(?:database fileblob count|pg_fileblobs)[^0-9]*(\d+)", status_lower)
     object_count_match = re.search(r"(?:mirrored object count|mirrored_objects)[^0-9]*(\d+)", status_lower)
 
@@ -473,7 +531,7 @@ def check_clean_run_proves_real_backup_artifacts(setup_info):
         return 0.0, "Clean run did not show evidence of recorded backup metadata in the job logs"
     if not backup_id_match:
         return 0.0, f"Clean run status does not include a backup identifier. Status: {status_doc[:300]}"
-    if not dump_status_ok:
+    if not dump_status_ok and not dump_size_match:
         return 0.0, f"Clean run status does not report a successful database dump. Status: {status_doc[:300]}"
     if not db_count_match or int(db_count_match.group(1)) <= 0:
         return 0.0, f"Clean run status does not report a non-zero database snapshot size. Status: {status_doc[:300]}"
@@ -506,6 +564,9 @@ def check_pipeline_handles_clean_and_drift_runs(setup_info):
         return 0.0, "Clean backup run did not update the persistent status surface"
     if not status_has_success(clean_status):
         return 0.0, f"Clean backup status does not indicate success. Status: {clean_status[:300]}"
+    runtime_ok, runtime_feedback = verify_backup_runtime_permissions_remain_scoped()
+    if not runtime_ok:
+        return 0.0, runtime_feedback
 
     ok, message = restore_live_drift(setup_info)
     if not ok:
@@ -544,6 +605,9 @@ def check_pipeline_handles_clean_and_drift_runs(setup_info):
             "Dirty run did not report the extra object side of the drift. "
             f"Relevant excerpt:\n{extract_relevant_excerpt(drift_text, expected_stale)}"
         )
+    runtime_ok, runtime_feedback = verify_backup_runtime_permissions_remain_scoped()
+    if not runtime_ok:
+        return 0.0, runtime_feedback
     scoped_ok, scoped_feedback = verify_minio_access_remains_scoped(setup_info)
     if not scoped_ok:
         return 0.0, scoped_feedback
@@ -593,6 +657,9 @@ def check_validation_catches_forward_gap(setup_info):
             "Forward-gap run did not report the missing object evidence. "
             f"Relevant excerpt:\n{extract_relevant_excerpt(text, orphan_key)}"
         )
+    runtime_ok, runtime_feedback = verify_backup_runtime_permissions_remain_scoped()
+    if not runtime_ok:
+        return 0.0, runtime_feedback
 
     return 1.0, "Validation fails closed and reports a database record with no matching object"
 
@@ -638,6 +705,9 @@ def check_validation_catches_reverse_gap(setup_info):
             "Reverse-gap run did not report the extra object evidence. "
             f"Relevant excerpt:\n{extract_relevant_excerpt(text, extra_key)}"
         )
+    runtime_ok, runtime_feedback = verify_backup_runtime_permissions_remain_scoped()
+    if not runtime_ok:
+        return 0.0, runtime_feedback
 
     return 1.0, "Validation fails closed and reports an object with no matching database record"
 
@@ -695,6 +765,9 @@ def check_validation_catches_balanced_set_drift(setup_info):
             "Balanced drift was not reported as both missing and extra set drift. "
             f"Relevant excerpt:\n{extract_relevant_excerpt(text, missing_key)}"
         )
+    runtime_ok, runtime_feedback = verify_backup_runtime_permissions_remain_scoped()
+    if not runtime_ok:
+        return 0.0, runtime_feedback
 
     return 1.0, "Validation catches equal-count set drift instead of relying on simple totals"
 

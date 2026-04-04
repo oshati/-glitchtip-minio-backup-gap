@@ -490,6 +490,9 @@ rules:
 - apiGroups: [""]
   resources: ["configmaps"]
   verbs: ["get", "patch", "update"]
+- apiGroups: ["batch"]
+  resources: ["cronjobs"]
+  verbs: ["get", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -570,6 +573,78 @@ spec:
 EOF
 
 ###############################################
+# RUNTIME ENFORCER: CRONJOB THAT RECONCILES
+# THE APPROVED SERVICE ACCOUNT FOR THE BACKUP
+# CRONJOB. One-off serviceAccountName edits
+# will drift back unless the approved runtime
+# baseline is updated too.
+###############################################
+echo "[setup] Creating backup runtime manager..."
+
+kubectl create configmap glitchtip-backup-runtime-original -n glitchtip \
+  --from-literal="serviceAccountName=default" \
+  --dry-run=client -o yaml | kubectl apply -f - 2>/dev/null || true
+
+kubectl apply -f - <<'EOF'
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: glitchtip-backup-template-manager
+  namespace: glitchtip
+  labels:
+    app: glitchtip
+    component: backup-template
+  annotations:
+    description: "Reconciles approved backup job runtime settings"
+spec:
+  schedule: "*/1 * * * *"
+  successfulJobsHistoryLimit: 1
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      activeDeadlineSeconds: 60
+      template:
+        metadata:
+          labels:
+            app: glitchtip
+            job: backup-template
+        spec:
+          serviceAccountName: backup-lifecycle-sa
+          restartPolicy: Never
+          containers:
+          - name: manager
+            image: docker.io/bitnamilegacy/postgresql:17.0.0-debian-12-r11
+            imagePullPolicy: IfNotPresent
+            command:
+            - /bin/bash
+            - -c
+            - |
+              APPROVED_SA=$(tr -d '[:space:]' < /approved/serviceAccountName 2>/dev/null)
+              if [ -z "${APPROVED_SA}" ]; then
+                APPROVED_SA="default"
+              fi
+              PATCH="{\"spec\":{\"jobTemplate\":{\"spec\":{\"template\":{\"spec\":{\"serviceAccountName\":\"${APPROVED_SA}\"}}}}}}"
+              TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
+              CACERT=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+              curl -sf --cacert "${CACERT}" \
+                -X PATCH \
+                -H "Authorization: Bearer ${TOKEN}" \
+                -H "Content-Type: application/merge-patch+json" \
+                -d "${PATCH}" \
+                "https://kubernetes.default.svc/apis/batch/v1/namespaces/glitchtip/cronjobs/glitchtip-backup" >/dev/null 2>&1 || true
+              echo "Runtime policy reconciliation complete."
+            volumeMounts:
+            - name: approved-runtime
+              mountPath: /approved
+          volumes:
+          - name: approved-runtime
+            configMap:
+              name: glitchtip-backup-runtime-original
+              optional: true
+EOF
+
+###############################################
 # MISLEADING DOCUMENTATION (no longer tells the agent the answer)
 ###############################################
 echo "[setup] Creating documentation ConfigMaps..."
@@ -645,6 +720,7 @@ data:
     ### Known Issues
     - Backup storage is ephemeral (emptyDir) — backups are lost when pod terminates
     - Status note is only as trustworthy as the backup validation step
+    - Ad-hoc backup job template edits have not always survived the next lifecycle reconciliation
     - No off-site backup replication configured
     - Disk space monitoring not configured for backup volume
 
@@ -657,10 +733,12 @@ EOF
 ###############################################
 kubectl annotate configmap/glitchtip-backup-script -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate configmap/glitchtip-backup-script-original -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+kubectl annotate configmap/glitchtip-backup-runtime-original -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate configmap/glitchtip-dr-incident-2024q3 -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate configmap/glitchtip-backup-status -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate cronjob/glitchtip-backup -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate cronjob/glitchtip-backup-retention-manager -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+kubectl annotate cronjob/glitchtip-backup-template-manager -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate secret/glitchtip-minio-creds -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate networkpolicy/glitchtip-minio-access-policy -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 

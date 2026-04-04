@@ -6,8 +6,10 @@ echo "[solution] Inspecting the current backup pipeline..."
 kubectl get cronjob glitchtip-backup -n glitchtip >/dev/null
 kubectl get configmap glitchtip-backup-script -n glitchtip >/dev/null
 kubectl get configmap glitchtip-backup-script-original -n glitchtip >/dev/null
+kubectl get configmap glitchtip-backup-runtime-original -n glitchtip >/dev/null
+kubectl get cronjob glitchtip-backup-template-manager -n glitchtip >/dev/null
 
-echo "[solution] Current incident: backup script is mirrored through a compliance baseline, so both active and approved scripts must be fixed."
+echo "[solution] Current incident: both the backup script and the backup runtime identity are reconciled through compliance baselines."
 echo "[solution] Writing a replacement script that performs exact set validation and reports the latest run state."
 
 cat > /tmp/glitchtip-backup-fixed.sh <<'SCRIPT_EOF'
@@ -187,6 +189,7 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["configmaps"]
+  resourceNames: ["glitchtip-backup-status"]
   verbs: ["get", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -212,6 +215,12 @@ kubectl create configmap glitchtip-backup-script \
 
 kubectl create configmap glitchtip-backup-script-original \
   --from-file=backup.sh=/tmp/glitchtip-backup-fixed.sh \
+  -n glitchtip \
+  --dry-run=client -o yaml | kubectl apply -f -
+
+echo "[solution] Updating the approved runtime baseline to use the dedicated status-reporting service account..."
+kubectl create configmap glitchtip-backup-runtime-original \
+  --from-literal=serviceAccountName=glitchtip-backup-sa \
   -n glitchtip \
   --dry-run=client -o yaml | kubectl apply -f -
 
