@@ -8,15 +8,17 @@ It is "does the backup pipeline behave correctly on both clean and dirty data?".
 Objectives:
 1. pipeline_handles_clean_and_drift_runs
    - A clean run must succeed and update the persistent status surface.
-   - The built-in live drift scenario must fail and update that status surface.
-2. validation_catches_forward_gap
+   - The built-in live drift scenario must fail, report both sides of the drift,
+     and preserve scoped MinIO access.
+2. clean_run_proves_real_backup_artifacts
+   - A clean run must show evidence that a real dump and object capture were
+     produced, not just that validation passed.
+3. validation_catches_forward_gap
    - A database record with no matching object must fail closed and be reported.
-3. validation_catches_reverse_gap
+4. validation_catches_reverse_gap
    - An object with no matching database record must fail closed and be reported.
-4. validation_catches_balanced_set_drift
+5. validation_catches_balanced_set_drift
    - Equal counts but mismatched sets must still fail closed and be reported.
-5. minio_access_remains_scoped
-   - Fixing the pipeline must not broaden MinIO access to arbitrary workloads.
 """
 
 import json
@@ -274,7 +276,19 @@ def extract_relevant_excerpt(text, expected_path="", window=6, fallback_lines=12
 
     interesting = [
         idx for idx, line in enumerate(lowered_lines)
-        if any(token in line for token in ["validation", "missing", "orphan", "extra", "result:", "status configmap"])
+        if any(token in line for token in [
+            "validation",
+            "missing",
+            "orphan",
+            "extra",
+            "result:",
+            "status configmap",
+            "tracked",
+            "mirror",
+            "backup id",
+            "pg_dump",
+            "artifact",
+        ])
     ]
     if interesting:
         start = max(0, interesting[0] - 2)
@@ -284,61 +298,64 @@ def extract_relevant_excerpt(text, expected_path="", window=6, fallback_lines=12
     return "\n".join(lines[:fallback_lines])
 
 
-def has_path_with_context_tokens(text, expected_path, tokens, window=6):
+def has_path_with_context_patterns(text, expected_path, patterns, window=10):
     lines = text.splitlines()
     lowered_lines = [line.lower() for line in lines]
     expected = expected_path.lower()
+
+    expected_seen = any(expected in line for line in lowered_lines)
+    if not expected_seen:
+        return False
 
     for idx, line in enumerate(lowered_lines):
         if expected in line:
             start = max(0, idx - window)
             end = min(len(lowered_lines), idx + window + 1)
             context = "\n".join(lowered_lines[start:end])
-            if any(token in context for token in tokens):
+            if any(re.search(pattern, context) for pattern in patterns):
                 return True
-    return False
+
+    whole_text = "\n".join(lowered_lines)
+    return any(re.search(pattern, whole_text) for pattern in patterns)
 
 
 def evidence_for_forward_gap(text, expected_path):
-    forward_keywords = [
-        "missing from object storage",
-        "missing from minio",
-        "no object-store match",
-        "database references missing",
-        "referenced blob",
-        "missing_in_object_storage",
-        "point to missing object",
-        "point at missing object",
-        "objects not found in object storage",
-        "objects not found in storage",
-        "record exists, object missing",
-        "dangling",
-        "missing:",
-        "missing object",
+    forward_patterns = [
+        r"missing(?: from)? (?:the )?(?:mirrored )?(?:backup|mirror|object storage|minio)",
+        r"not found in (?:the )?(?:mirrored )?(?:backup|mirror|object storage|minio)",
+        r"(?:files?|objects?|blobs?) referenced in (?:db|database) .*missing",
+        r"(?:files?|objects?|blobs?) in (?:db|database) but missing from (?:the )?(?:mirror|backup|object storage)",
+        r"(?:db|database).*(?:blob|file|path|record).*(?:missing|not found)",
+        r"database references.*missing",
+        r"missing_in_object_storage",
+        r"lost on restore",
+        r"path mismatch",
+        r"missing:",
+        r"missing files?",
     ]
-    return has_path_with_context_tokens(text, expected_path, forward_keywords)
+
+    return has_path_with_context_patterns(text, expected_path, forward_patterns)
 
 
 def evidence_for_reverse_gap(text, expected_path):
-    reverse_keywords = [
-        "extra object",
-        "extra objects",
-        "no database record",
-        "objects without record",
-        "extra_in_object_storage",
-        "orphan",
-        "orphaned",
-        "no matching db record",
-        "no matching database record",
-        "object in storage have no",
-        "objects in storage have no",
-        "orphan:",
-        "orphaned:",
+    reverse_patterns = [
+        r"extra (?:object|objects|file|files)",
+        r"orphan(?:ed)?",
+        r"no matching (?:db|database)(?: record| fileblob)?",
+        r"not tracked in (?:db|database)",
+        r"not referenced in (?:db|database)",
+        r"(?:files?|objects?) in (?:mirror|backup|object storage) but not (?:tracked|referenced) in (?:db|database)",
+        r"(?:files?|objects?) in (?:mirror|backup|object storage) but not in (?:db|database)",
+        r"(?:files?|objects?) in (?:mirror|backup|object storage) have no matching",
+        r"extra_in_object_storage",
+        r"leftover",
+        r"unexpected (?:object|objects|file|files)",
     ]
-    return has_path_with_context_tokens(text, expected_path, reverse_keywords)
+
+    return has_path_with_context_patterns(text, expected_path, reverse_patterns)
 
 
-def check_minio_access_remains_scoped(setup_info):
+def verify_minio_access_remains_scoped(setup_info):
     endpoint_host = extract_endpoint_host(setup_info)
     if not endpoint_host:
         endpoint_host = "glitchtip-minio"
@@ -349,7 +366,7 @@ def check_minio_access_remains_scoped(setup_info):
         timeout=20,
     )
     if rc != 0:
-        return 0.0, "Scoped MinIO access policy is missing"
+        return False, "Scoped MinIO access policy is missing"
 
     ts = int(time.time())
     probe_name = f"grader-minio-probe-{ts}"
@@ -376,7 +393,7 @@ EOF""",
         timeout=30,
     )
     if rc != 0:
-        return 0.0, f"Could not create unauthorized probe pod: {(err or out)[:200]}"
+        return False, f"Could not create unauthorized probe pod: {(err or out)[:200]}"
 
     try:
         ready = False
@@ -391,11 +408,11 @@ EOF""",
                 ready = True
                 break
             if phase in ("Failed", "Succeeded"):
-                return 0.0, f"Unauthorized probe pod exited early with phase {phase}"
+                return False, f"Unauthorized probe pod exited early with phase {phase}"
             time.sleep(5)
 
         if not ready:
-            return 0.0, f"Unauthorized probe pod did not become ready (last phase: {phase or 'unknown'})"
+            return False, f"Unauthorized probe pod did not become ready (last phase: {phase or 'unknown'})"
 
         rc, out, err = run_cmd(
             f"kubectl exec -n glitchtip {probe_name} -- "
@@ -408,12 +425,62 @@ EOF""",
 
     status_code = out.strip()
     if rc == 0 and status_code == "200":
-        return 0.0, (
+        return False, (
             "Unauthorized in-cluster probe can still reach MinIO. "
             "The fix broadened object-store exposure instead of preserving scoped access."
         )
 
-    return 1.0, "MinIO access remains scoped to authorized workloads after the backup fix"
+    return True, "MinIO access remains scoped to authorized workloads after the backup fix"
+
+
+def check_clean_run_proves_real_backup_artifacts(setup_info):
+    ok, message = ensure_consistent_dataset(setup_info)
+    if not ok:
+        return 0.0, message
+
+    ts = int(time.time())
+    marker = f"GRADER-ARTIFACT-{ts}"
+    set_status_doc(marker)
+
+    job_name = f"grader-artifact-{ts}"
+    completed, logs, failed, err = trigger_backup_job(job_name)
+    status_doc = wait_for_status_change(marker)
+    cleanup_job(job_name)
+
+    job_failed = failed.isdigit() and int(failed) > 0
+    logs_lower = logs.lower()
+    status_lower = status_doc.lower()
+
+    if err:
+        return 0.0, err
+    if not completed or job_failed:
+        return 0.0, f"Clean artifact-evidence run did not succeed. Logs:\n{extract_relevant_excerpt(logs)}"
+    if not status_doc or marker in status_doc:
+        return 0.0, "Clean artifact-evidence run did not update the persistent status surface"
+    if not status_has_success(status_doc):
+        return 0.0, f"Clean artifact-evidence status does not indicate success. Status: {status_doc[:300]}"
+
+    has_dump_log = "glitchtip_db.dump" in logs_lower
+    has_manifest_log = "backup_manifest.txt" in logs_lower or "recording backup metadata" in logs_lower
+    backup_id_match = re.search(r"(?:backup id|backup_id)[^a-z0-9-]*(glitchtip-\d{8}_\d{6})", status_lower)
+    dump_status_ok = re.search(r"(?:postgresql dump|pg_dump)[^a-z0-9]*(?:success|ok|completed)", status_lower)
+    db_count_match = re.search(r"(?:database fileblob count|pg_fileblobs)[^0-9]*(\d+)", status_lower)
+    object_count_match = re.search(r"(?:mirrored object count|mirrored_objects)[^0-9]*(\d+)", status_lower)
+
+    if not has_dump_log:
+        return 0.0, "Clean run did not show evidence of a real PostgreSQL dump artifact in the job logs"
+    if not has_manifest_log:
+        return 0.0, "Clean run did not show evidence of recorded backup metadata in the job logs"
+    if not backup_id_match:
+        return 0.0, f"Clean run status does not include a backup identifier. Status: {status_doc[:300]}"
+    if not dump_status_ok:
+        return 0.0, f"Clean run status does not report a successful database dump. Status: {status_doc[:300]}"
+    if not db_count_match or int(db_count_match.group(1)) <= 0:
+        return 0.0, f"Clean run status does not report a non-zero database snapshot size. Status: {status_doc[:300]}"
+    if not object_count_match or int(object_count_match.group(1)) <= 0:
+        return 0.0, f"Clean run status does not report a non-zero attachment capture size. Status: {status_doc[:300]}"
+
+    return 1.0, "Clean run proves a real dump and object capture were produced, not just a green validation result"
 
 
 def check_pipeline_handles_clean_and_drift_runs(setup_info):
@@ -477,8 +544,11 @@ def check_pipeline_handles_clean_and_drift_runs(setup_info):
             "Dirty run did not report the extra object side of the drift. "
             f"Relevant excerpt:\n{extract_relevant_excerpt(drift_text, expected_stale)}"
         )
+    scoped_ok, scoped_feedback = verify_minio_access_remains_scoped(setup_info)
+    if not scoped_ok:
+        return 0.0, scoped_feedback
 
-    return 1.0, "Pipeline succeeds on clean data, fails on the built-in drift, and reports both states persistently"
+    return 1.0, "Pipeline succeeds on clean data, fails on live drift, reports both mismatch directions, and keeps MinIO access scoped"
 
 
 def check_validation_catches_forward_gap(setup_info):
@@ -640,10 +710,10 @@ def grade(*args, **kwargs) -> GradingResult:
 
     checks = {
         "pipeline_handles_clean_and_drift_runs": check_pipeline_handles_clean_and_drift_runs,
+        "clean_run_proves_real_backup_artifacts": check_clean_run_proves_real_backup_artifacts,
         "validation_catches_forward_gap": check_validation_catches_forward_gap,
         "validation_catches_reverse_gap": check_validation_catches_reverse_gap,
         "validation_catches_balanced_set_drift": check_validation_catches_balanced_set_drift,
-        "minio_access_remains_scoped": check_minio_access_remains_scoped,
     }
 
     weight = 1.0 / len(checks)
