@@ -166,6 +166,16 @@ def get_backup_service_account():
     return out.strip("'") if rc == 0 else ""
 
 
+def get_kubectl_json(cmd, timeout=30):
+    rc, out, err = run_cmd(cmd, timeout=timeout)
+    if rc != 0:
+        return None, err or out or "kubectl command failed"
+    try:
+        return json.loads(out), ""
+    except Exception as e:
+        return None, f"Could not parse kubectl JSON output: {e}"
+
+
 def set_status_doc(text):
     payload = json.dumps({"data": {STATUS_KEY: text}})
     rc, _, err = run_cmd(
@@ -451,31 +461,93 @@ def verify_backup_runtime_permissions_remain_scoped():
             "having broad maintenance write access."
         )
 
-    subject = f"system:serviceaccount:glitchtip:{sa_name}"
+    rolebindings, err = get_kubectl_json("kubectl get rolebindings -n glitchtip -o json", timeout=30)
+    if rolebindings is None:
+        return False, f"Could not inspect rolebindings for backup runtime identity: {err}"
 
-    def can_i(verb, resource, resource_name):
-        rc, out, _ = run_cmd(
-            f"kubectl auth can-i --as={subject} {verb} {resource} "
-            f"--resource-name={resource_name} -n glitchtip",
-            timeout=20,
+    roles, err = get_kubectl_json("kubectl get roles -n glitchtip -o json", timeout=30)
+    if roles is None:
+        return False, f"Could not inspect roles for backup runtime identity: {err}"
+
+    clusterrolebindings, err = get_kubectl_json("kubectl get clusterrolebindings -o json", timeout=30)
+    if clusterrolebindings is None:
+        return False, f"Could not inspect clusterrolebindings for backup runtime identity: {err}"
+
+    clusterroles, err = get_kubectl_json("kubectl get clusterroles -o json", timeout=30)
+    if clusterroles is None:
+        return False, f"Could not inspect clusterroles for backup runtime identity: {err}"
+
+    role_map = {item["metadata"]["name"]: item.get("rules", []) for item in roles.get("items", [])}
+    clusterrole_map = {item["metadata"]["name"]: item.get("rules", []) for item in clusterroles.get("items", [])}
+
+    def subject_matches(subject):
+        return (
+            subject.get("kind") == "ServiceAccount"
+            and subject.get("name") == sa_name
+            and subject.get("namespace", "glitchtip") == "glitchtip"
         )
-        return rc == 0 and out.strip().lower() == "yes"
 
-    can_get_status = can_i("get", "configmaps", STATUS_CONFIGMAP)
-    can_patch_status = can_i("patch", "configmaps", STATUS_CONFIGMAP)
-    can_update_status = can_i("update", "configmaps", STATUS_CONFIGMAP)
-    can_patch_script = can_i("patch", "configmaps", "glitchtip-backup-script")
-    can_patch_original = can_i("patch", "configmaps", "glitchtip-backup-script-original")
-    can_patch_runtime_baseline = can_i("patch", "configmaps", "glitchtip-backup-runtime-original")
-    can_patch_backup_cronjob = can_i("patch", "cronjobs.batch", "glitchtip-backup")
+    bound_rules = []
+    for binding in rolebindings.get("items", []):
+        subjects = binding.get("subjects") or []
+        if not any(subject_matches(subject) for subject in subjects):
+            continue
+        role_ref = binding.get("roleRef") or {}
+        if role_ref.get("kind") == "Role":
+            bound_rules.extend(role_map.get(role_ref.get("name", ""), []))
+        elif role_ref.get("kind") == "ClusterRole":
+            bound_rules.extend(clusterrole_map.get(role_ref.get("name", ""), []))
 
-    if not can_get_status or not (can_patch_status or can_update_status):
+    for binding in clusterrolebindings.get("items", []):
+        subjects = binding.get("subjects") or []
+        if not any(subject_matches(subject) for subject in subjects):
+            continue
+        role_ref = binding.get("roleRef") or {}
+        if role_ref.get("kind") == "ClusterRole":
+            bound_rules.extend(clusterrole_map.get(role_ref.get("name", ""), []))
+
+    def rule_allows(rule, api_group, resource, verbs, resource_name=None):
+        api_groups = rule.get("apiGroups") or [""]
+        resources = rule.get("resources") or []
+        rule_verbs = rule.get("verbs") or []
+        if api_group not in api_groups and "*" not in api_groups:
+            return False
+        if resource not in resources and "*" not in resources:
+            return False
+        if not any(verb in rule_verbs or "*" in rule_verbs for verb in verbs):
+            return False
+        resource_names = rule.get("resourceNames")
+        if resource_name is None:
+            return True
+        if resource_names is None or "*" in resource_names:
+            return True
+        return resource_name in resource_names
+
+    def rule_is_broad_config_writer(rule):
+        if not rule_allows(rule, "", "configmaps", ["patch", "update"]):
+            return False
+        resource_names = rule.get("resourceNames")
+        if resource_names is None or "*" in resource_names:
+            return True
+        return set(resource_names) != {STATUS_CONFIGMAP}
+
+    def rule_can_patch_backup_cronjob(rule):
+        return rule_allows(rule, "batch", "cronjobs", ["patch", "update"], "glitchtip-backup")
+
+    can_patch_status = any(
+        rule_allows(rule, "", "configmaps", ["patch", "update"], STATUS_CONFIGMAP)
+        for rule in bound_rules
+    )
+    has_broad_config_access = any(rule_is_broad_config_writer(rule) for rule in bound_rules)
+    can_patch_backup_cronjob = any(rule_can_patch_backup_cronjob(rule) for rule in bound_rules)
+
+    if not can_patch_status:
         return False, (
             f"Backup runtime identity '{sa_name}' cannot publish the run-status note. "
             "It needs narrow write access to the status ConfigMap."
         )
 
-    if any([can_patch_script, can_patch_original, can_patch_runtime_baseline, can_patch_backup_cronjob]):
+    if has_broad_config_access or can_patch_backup_cronjob:
         return False, (
             f"Backup runtime identity '{sa_name}' is too broad. "
             "It can rewrite backup configuration instead of only publishing status."
