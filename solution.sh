@@ -30,7 +30,7 @@ EXTRA_COUNT=0
 PG_DUMP_STATUS="not-started"
 
 json_escape() {
-  python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'
+  sed ':a;N;$!ba;s/\\/\\\\/g;s/"/\\"/g;s/\n/\\n/g' | sed 's/^/"/;s/$/"/'
 }
 
 report_status() {
