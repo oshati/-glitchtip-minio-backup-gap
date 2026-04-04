@@ -82,24 +82,32 @@ data:
     MINIO_OBJECTS=$(mc ls --recursive glitchtip-store/glitchtip-attachments/ 2>/dev/null | wc -l)
     echo "[backup] MinIO backup complete: ${MINIO_OBJECTS} objects mirrored."
 
-    # Validation — compare PG fileblob count (from init container) against MinIO object count
+    # Bidirectional validation — compare PG count vs MinIO count in BOTH directions
     echo "[backup] Running post-backup validation..."
     PG_COUNT=$(cat /backups/.pg_fileblob_count 2>/dev/null | tr -d '[:space:]')
     PG_COUNT=${PG_COUNT:-0}
     echo "[backup] Validation: PG fileblob records=${PG_COUNT}, MinIO objects=${MINIO_OBJECTS}"
 
-    if [ "${PG_COUNT}" -gt "${MINIO_OBJECTS}" ]; then
-      DIFF=$((PG_COUNT - MINIO_OBJECTS))
-      BACKUP_STATUS="failed"
-      BACKUP_MSG="PG has ${PG_COUNT} records but MinIO only has ${MINIO_OBJECTS} objects — ${DIFF} missing"
-      echo "[backup] VALIDATION FAILED: ${BACKUP_MSG}"
-      exit 1
-    fi
-
     if [ "${MINIO_OBJECTS}" -eq 0 ]; then
       BACKUP_STATUS="failed"
       BACKUP_MSG="MinIO has 0 objects — bucket may be empty or unreachable"
       echo "[backup] VALIDATION FAILED: ${BACKUP_MSG}"
+      exit 1
+    fi
+
+    if [ "${PG_COUNT}" -gt "${MINIO_OBJECTS}" ]; then
+      DIFF=$((PG_COUNT - MINIO_OBJECTS))
+      BACKUP_STATUS="failed"
+      BACKUP_MSG="MISMATCH: PG has ${PG_COUNT} records but MinIO only has ${MINIO_OBJECTS} objects — ${DIFF} orphan records not in MinIO"
+      echo "[backup] VALIDATION FAILED: ${BACKUP_MSG}"
+      exit 1
+    fi
+
+    if [ "${MINIO_OBJECTS}" -gt "${PG_COUNT}" ]; then
+      DIFF=$((MINIO_OBJECTS - PG_COUNT))
+      BACKUP_STATUS="failed"
+      BACKUP_MSG="MISMATCH: MinIO has ${MINIO_OBJECTS} objects but PG only has ${PG_COUNT} records — ${DIFF} stale objects not in database"
+      echo "[backup] VALIDATION FAILED: MinIO has more objects than PG records — stale objects detected"
       exit 1
     fi
 

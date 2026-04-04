@@ -2,13 +2,14 @@
 """
 Grader for glitchtip-minio-backup-gap task.
 
-ALL checks are STRICT FUNCTIONAL end-to-end tests.
+ALL checks are STRICT FUNCTIONAL end-to-end tests that mutate the environment
+AFTER the agent finishes, then test the agent's code against the new state.
 
 4 subscores, each weight 1/4:
 1. backup_script_has_minio — Backup ConfigMap has MinIO backup commands
-2. backup_handles_concurrent_writes — Backup handles data injected DURING the backup run
-3. validation_catches_orphans — Backup detects PG records with no MinIO objects
-4. backup_notifies_on_failure — Backup script reports failure status to a discoverable location
+2. validation_catches_orphans — PG record with no MinIO object: does validation catch it?
+3. backup_detects_stale_objects — MinIO objects with no PG record: does validation catch the reverse?
+4. backup_excludes_deleted_records — PG records deleted after agent finishes: does backup reflect current state?
 """
 
 import json
@@ -80,17 +81,16 @@ def pg_sql(pg_pod, sql, setup_info):
     return out.strip()
 
 
-def minio_count(minio_pod, setup_info):
+def minio_exec(minio_pod, mc_cmd, setup_info):
     ak = setup_info.get("MINIO_ACCESS_KEY", "")
     sk = setup_info.get("MINIO_SECRET_KEY", "")
-    bucket = setup_info.get("MINIO_BUCKET", "glitchtip-attachments")
     rc, out, _ = run_cmd(
         f"kubectl exec -n glitchtip {minio_pod} -- "
         f"sh -c \"mc alias set local http://localhost:9000 '{ak}' '{sk}' "
-        f">/dev/null 2>&1; mc ls --recursive local/{bucket}/ 2>/dev/null | wc -l\"",
+        f">/dev/null 2>&1; {mc_cmd}\"",
         timeout=15,
     )
-    return int(out.strip()) if out.strip().isdigit() else 0
+    return rc, out
 
 
 def trigger_backup_job(job_name, wait_seconds=300):
@@ -166,128 +166,29 @@ def check_backup_script_has_minio(setup_info):
 
 
 # ─────────────────────────────────────────────
-# CHECK 2: backup_handles_concurrent_writes
-# ─────────────────────────────────────────────
-def check_backup_handles_concurrent_writes(setup_info):
-    """
-    FUNCTIONAL E2E: Start a backup Job, then DURING the backup inject new
-    MinIO objects and PG records. After the Job completes, verify:
-    - The backup didn't crash/corrupt from concurrent data
-    - The Job still exited 0
-    - Logs show both PG and MinIO backup evidence
-
-    Agents never design for concurrent writes. Their scripts assume static data.
-    If the backup crashes or exits non-zero due to the injected data, this fails.
-    """
-    pg_pod = get_pg_pod()
-    minio_pod = get_minio_pod()
-    if not pg_pod or not minio_pod:
-        return 0.0, f"Missing pods: pg={bool(pg_pod)}, minio={bool(minio_pod)}"
-
-    job_name = f"grader-concurrent-{int(time.time())}"
-
-    # Start the backup Job
-    rc, _, stderr = run_cmd(
-        f"kubectl create job {job_name} --from=cronjob/glitchtip-backup -n glitchtip 2>&1",
-        timeout=15,
-    )
-    if rc != 0:
-        return 0.0, f"Could not create backup job: {stderr[:200]}"
-
-    # Wait for the Job pod to be running (not just created)
-    for i in range(30):
-        rc, phase, _ = run_cmd(
-            f"kubectl get pods -n glitchtip -l job-name={job_name} "
-            f"-o jsonpath='{{.items[0].status.phase}}' 2>/dev/null"
-        )
-        if phase.strip("'") in ("Running", "Succeeded"):
-            break
-        time.sleep(5)
-
-    # NOW inject concurrent data while backup is running
-    ts = int(time.time())
-    ak = setup_info.get("MINIO_ACCESS_KEY", "")
-    sk = setup_info.get("MINIO_SECRET_KEY", "")
-    bucket = setup_info.get("MINIO_BUCKET", "glitchtip-attachments")
-
-    # Inject 3 new MinIO objects
-    for i in range(3):
-        run_cmd(
-            f"kubectl exec -n glitchtip {minio_pod} -- "
-            f"sh -c \"echo 'concurrent-write-{ts}-{i}' | mc pipe local/{bucket}/concurrent/obj_{ts}_{i}.dat 2>/dev/null\"",
-            timeout=10,
-        )
-
-    # Inject 3 new PG records
-    for i in range(3):
-        pg_sql(pg_pod,
-            f"INSERT INTO files_fileblob (created, checksum, size, blob) "
-            f"VALUES (NOW(), 'concurrent_{ts}_{i}', 512, 'concurrent/obj_{ts}_{i}.dat') "
-            f"ON CONFLICT (checksum) DO NOTHING;",
-            setup_info,
-        )
-
-    # Wait for the Job to finish (up to 5 min)
-    completed = False
-    for i in range(30):
-        rc, status, _ = run_cmd(
-            f"kubectl get job {job_name} -n glitchtip "
-            f"-o jsonpath='{{.status.succeeded}}/{{.status.failed}}' 2>/dev/null"
-        )
-        parts = status.strip("'").split("/")
-        succeeded = parts[0] if len(parts) > 0 else ""
-        failed = parts[1] if len(parts) > 1 else ""
-
-        if succeeded == "1":
-            completed = True
-            break
-        if failed.isdigit() and int(failed) > 0:
-            break
-        time.sleep(10)
-
-    # Get logs
-    rc, logs, _ = run_cmd(
-        f"kubectl logs -n glitchtip -l job-name={job_name} --all-containers --tail=300 2>/dev/null"
-    )
-
-    if not completed:
-        return 0.0, f"Backup crashed during concurrent writes (did not exit 0). Logs: {logs[:300]}"
-
-    has_pg = any(w in logs.lower() for w in ["pg_dump", "postgresql", "dump complete", "glitchtip_db.dump"])
-    has_minio = any(w in logs.lower() for w in ["mirror", "mc mirror", "minio backup", "objects mirrored", "attachments"])
-
-    if has_pg and has_minio:
-        return 1.0, "Backup survived concurrent writes — completed with PG and MinIO evidence"
-    elif has_pg:
-        return 0.0, f"Backup completed but no MinIO evidence after concurrent injection. Logs: {logs[:200]}"
-    else:
-        return 0.0, f"Backup completed but missing evidence. Logs: {logs[:200]}"
-
-
-# ─────────────────────────────────────────────
-# CHECK 3: validation_catches_orphans
+# CHECK 2: validation_catches_orphans
+# Agent's validation must detect PG records that
+# have NO corresponding MinIO object (forward orphan).
+# Grader inserts the orphan AFTER agent finishes.
 # ─────────────────────────────────────────────
 def check_validation_catches_orphans(setup_info):
     """
-    FUNCTIONAL E2E: Insert an orphan PG record (metadata pointing to a
-    non-existent MinIO object), then trigger backup and verify the validation
-    step detects the mismatch.
+    Insert an orphan PG record (metadata pointing to a non-existent MinIO object),
+    then trigger backup and verify the validation step detects the mismatch.
     """
     pg_pod = get_pg_pod()
     if not pg_pod:
         return 0.0, "No PostgreSQL pod found"
 
-    # Insert orphan record
     ts = int(time.time())
     orphan_key = f"attachments/orphan_test/missing_object_{ts}.dmp"
     pg_sql(pg_pod,
         f"INSERT INTO files_fileblob (created, checksum, size, blob) "
-        f"VALUES (NOW(), 'orphan_test_{ts}', 1024, '{orphan_key}') "
+        f"VALUES (NOW(), 'orphan_fwd_{ts}', 1024, '{orphan_key}') "
         f"ON CONFLICT (checksum) DO NOTHING;",
         setup_info,
     )
 
-    # Trigger backup Job
     job_name = f"grader-orphan-{ts}"
     completed, logs, failed = trigger_backup_job(job_name)
 
@@ -301,135 +202,186 @@ def check_validation_catches_orphans(setup_info):
     job_failed = failed.isdigit() and int(failed) > 0
 
     if detected or job_failed:
-        return 1.0, "Validation detected the orphan record mismatch"
+        return 1.0, "Validation detected the forward orphan (PG record with no MinIO object)"
     else:
-        return 0.0, f"Validation did NOT catch the orphan. Logs: {logs[:300]}"
+        return 0.0, f"Validation did NOT catch the forward orphan. Logs: {logs[:300]}"
 
 
 # ─────────────────────────────────────────────
-# CHECK 4: backup_notifies_on_failure
+# CHECK 3: backup_detects_stale_objects
+# Agent's validation must detect MinIO objects that
+# have NO corresponding PG record (reverse orphan).
+# Grader adds MinIO objects with no PG record AFTER
+# agent finishes.
 # ─────────────────────────────────────────────
-def check_backup_notifies_on_failure(setup_info):
+def check_backup_detects_stale_objects(setup_info):
     """
-    FUNCTIONAL E2E: Deliberately break MinIO (scale to 0), trigger a backup,
-    then check if the backup script wrote failure status to a discoverable
-    location: ConfigMap, Kubernetes Event, file, or annotation.
+    Add 5 MinIO objects that have NO PG fileblob records (stale/orphaned objects).
+    Then trigger backup and verify the validation detects the reverse mismatch:
+    MinIO has more objects than PG has records.
 
-    Agents never build failure notification. They add 'exit 1' but don't
-    report the failure anywhere persistent. The grader checks for:
-    - A ConfigMap with backup status/failure info
-    - A Kubernetes Event created by the backup Job
-    - An annotation on the CronJob with failure info
-    - A log line with structured failure output (JSON or key=value)
-
-    After checking, restore MinIO to original state.
+    Agents build "PG count > MinIO count = fail" but almost never check
+    "MinIO count > PG count = stale objects."
     """
-    # Save current MinIO replica count
-    rc, replicas, _ = run_cmd(
-        "kubectl get deployment glitchtip-minio -n glitchtip "
-        "-o jsonpath='{.spec.replicas}' 2>/dev/null"
-    )
-    original_replicas = replicas.strip("'") or "1"
+    minio_pod = get_minio_pod()
+    if not minio_pod:
+        return 0.0, "No MinIO pod found"
 
-    # Break MinIO by scaling to 0
-    run_cmd("kubectl scale deployment glitchtip-minio -n glitchtip --replicas=0 2>/dev/null")
-    time.sleep(10)
-
-    # Trigger a backup Job — it should fail because MinIO is down
+    bucket = setup_info.get("MINIO_BUCKET", "glitchtip-attachments")
     ts = int(time.time())
-    job_name = f"grader-notify-{ts}"
-    completed, logs, failed = trigger_backup_job(job_name, wait_seconds=180)
 
-    # Restore MinIO immediately
-    run_cmd(f"kubectl scale deployment glitchtip-minio -n glitchtip --replicas={original_replicas} 2>/dev/null")
-    # Wait for MinIO to come back
-    for i in range(30):
-        rc, ready, _ = run_cmd(
-            "kubectl get deployment glitchtip-minio -n glitchtip "
-            "-o jsonpath='{.status.readyReplicas}' 2>/dev/null"
+    # Inject 5 stale MinIO objects with NO corresponding PG records
+    for i in range(5):
+        minio_exec(minio_pod,
+            f"echo 'stale-orphan-data-{ts}-{i}' | mc pipe local/{bucket}/stale_objects/orphan_{ts}_{i}.dat 2>/dev/null",
+            setup_info,
         )
-        if ready.strip("'") == original_replicas:
-            break
-        time.sleep(5)
 
-    # Now check if the agent's script NOTIFIED about the failure
-    # Check 1: ConfigMap with backup status
-    rc, cms, _ = run_cmd(
-        "kubectl get configmaps -n glitchtip -o json 2>/dev/null"
+    # Verify they were created
+    rc, count_str = minio_exec(minio_pod,
+        f"mc ls --recursive local/{bucket}/stale_objects/ 2>/dev/null | wc -l",
+        setup_info,
     )
-    has_status_cm = False
-    if cms:
-        try:
-            cm_list = json.loads(cms)
-            for cm in cm_list.get("items", []):
-                cm_data = " ".join(cm.get("data", {}).values()).lower()
-                cm_name = cm.get("metadata", {}).get("name", "").lower()
-                if ("backup" in cm_name and ("fail" in cm_data or "error" in cm_data or "status" in cm_data)):
-                    has_status_cm = True
-                    break
-                if "backup-status" in cm_name or "backup-report" in cm_name:
-                    has_status_cm = True
-                    break
-        except json.JSONDecodeError:
-            pass
+    stale_count = int(count_str.strip()) if count_str.strip().isdigit() else 0
 
-    # Check 2: Annotation on the CronJob
-    rc, annotations, _ = run_cmd(
-        "kubectl get cronjob glitchtip-backup -n glitchtip "
-        "-o jsonpath='{.metadata.annotations}' 2>/dev/null"
-    )
-    has_annotation = False
-    if annotations:
-        ann_lower = annotations.lower()
-        has_annotation = any(w in ann_lower for w in ["fail", "error", "status", "last-result"])
+    if stale_count < 3:
+        return 0.0, f"Could not inject stale objects into MinIO (only {stale_count} created)"
 
-    # Check 3: Kubernetes Events from backup
-    rc, events, _ = run_cmd(
-        f"kubectl get events -n glitchtip --field-selector reason!=Pulling,reason!=Pulled "
-        f"--sort-by=.lastTimestamp -o json 2>/dev/null"
-    )
-    has_event = False
-    if events:
-        try:
-            ev_list = json.loads(events)
-            for ev in ev_list.get("items", []):
-                msg = ev.get("message", "").lower()
-                reason = ev.get("reason", "").lower()
-                if "backup" in msg and ("fail" in msg or "error" in msg):
-                    has_event = True
-                    break
-                if "backupfail" in reason or "backup-fail" in reason:
-                    has_event = True
-                    break
-        except json.JSONDecodeError:
-            pass
+    # Trigger backup Job
+    job_name = f"grader-stale-{ts}"
+    completed, logs, failed = trigger_backup_job(job_name)
 
-    # Check 4: Structured failure in backup logs
-    has_structured_log = False
-    if logs:
-        logs_lower = logs.lower()
-        # Look for structured output: JSON, key=value, or explicit notification
-        has_structured_log = any(w in logs_lower for w in [
-            '"status": "fail', '"status":"fail',
-            "status=fail", "result=fail", "backup_status=fail",
-            "notification", "alert", "webhook",
-            "mattermost", "slack",
-            "writing failure status", "updating backup status",
-        ])
+    logs_lower = logs.lower()
 
-    notified = has_status_cm or has_annotation or has_event or has_structured_log
+    # Look for evidence the validation caught the REVERSE mismatch
+    # (MinIO has more objects than PG records)
+    detected = any(w in logs_lower for w in [
+        "stale", "orphan", "extra object", "minio has more",
+        "minio count", "mismatch", "inconsisten",
+        "more objects than", "objects without record",
+        "not in database", "not in pg", "no matching record",
+    ])
 
-    details = (
-        f"ConfigMap status={has_status_cm}, "
-        f"CronJob annotation={has_annotation}, "
-        f"K8s Event={has_event}, "
-        f"Structured log={has_structured_log}"
-    )
+    # Also accept: validation reports MinIO count > PG count as a warning/fail
+    # Look for comparative output where MinIO > PG
+    pg_pod = get_pg_pod()
+    if pg_pod:
+        pg_count_str = pg_sql(pg_pod,
+            "SELECT COUNT(*) FROM files_fileblob;",
+            setup_info,
+        )
+        pg_count = int(pg_count_str) if pg_count_str.isdigit() else 0
 
-    if notified:
-        return 1.0, f"Backup failure was reported: {details}"
+        # Check if logs mention both counts and the MinIO count is higher
+        minio_mentions = re.findall(r'minio[^0-9]*(\d+)', logs_lower)
+        pg_mentions = re.findall(r'pg[^0-9]*(\d+)', logs_lower)
+
+        if minio_mentions and pg_mentions:
+            max_minio = max(int(x) for x in minio_mentions)
+            max_pg = max(int(x) for x in pg_mentions)
+            if max_minio > max_pg:
+                detected = True
+
+    job_failed = failed.isdigit() and int(failed) > 0
+
+    if detected or job_failed:
+        return 1.0, f"Validation detected stale MinIO objects (reverse orphan). Stale injected: {stale_count}"
     else:
-        return 0.0, f"Backup failed but no notification found. {details}. Logs: {logs[:200]}"
+        return 0.0, f"Validation did NOT detect {stale_count} stale MinIO objects. Logs: {logs[:300]}"
+
+
+# ─────────────────────────────────────────────
+# CHECK 4: backup_excludes_deleted_records
+# Grader deletes PG records AFTER agent finishes,
+# then triggers backup. The backup's PG dump should
+# reflect the current (reduced) state. The validation
+# should report fewer PG records than MinIO objects.
+# ─────────────────────────────────────────────
+def check_backup_excludes_deleted_records(setup_info):
+    """
+    Delete 5 PG fileblob records AFTER the agent finishes (simulating data
+    cleanup between backup runs). Then trigger backup and verify:
+    1. The backup's PG dump reflects the CURRENT state (fewer records)
+    2. The validation detects that MinIO now has MORE objects than PG records
+
+    Agents assume PG and MinIO are always in sync at backup time. After deletion,
+    MinIO has objects that PG no longer references — this is the reverse of the
+    orphan check. The agent's validation must be bidirectional.
+    """
+    pg_pod = get_pg_pod()
+    if not pg_pod:
+        return 0.0, "No PostgreSQL pod found"
+
+    # Get current PG count before deletion
+    before_str = pg_sql(pg_pod,
+        "SELECT COUNT(*) FROM files_fileblob WHERE blob NOT LIKE 'attachments/orphan_test%' AND blob NOT LIKE 'concurrent/%' AND blob NOT LIKE 'stale_objects/%';",
+        setup_info,
+    )
+    before_count = int(before_str) if before_str.isdigit() else 0
+
+    if before_count < 10:
+        return 0.0, f"Not enough PG records to delete (only {before_count})"
+
+    # Delete 5 debug-symbol records (they have MinIO objects but we remove PG refs)
+    ts = int(time.time())
+    pg_sql(pg_pod,
+        "DELETE FROM files_fileblob WHERE blob LIKE 'debug-symbols/%' LIMIT 5;",
+        setup_info,
+    )
+
+    # Verify deletion worked
+    after_str = pg_sql(pg_pod,
+        "SELECT COUNT(*) FROM files_fileblob WHERE blob NOT LIKE 'attachments/orphan_test%' AND blob NOT LIKE 'concurrent/%' AND blob NOT LIKE 'stale_objects/%';",
+        setup_info,
+    )
+    after_count = int(after_str) if after_str.isdigit() else 0
+    deleted = before_count - after_count
+
+    if deleted < 1:
+        # Try alternative deletion
+        pg_sql(pg_pod,
+            f"DELETE FROM files_fileblob WHERE checksum LIKE 'sha1_dsym_%';",
+            setup_info,
+        )
+        after_str = pg_sql(pg_pod,
+            "SELECT COUNT(*) FROM files_fileblob WHERE blob NOT LIKE 'attachments/orphan_test%' AND blob NOT LIKE 'concurrent/%' AND blob NOT LIKE 'stale_objects/%';",
+            setup_info,
+        )
+        after_count = int(after_str) if after_str.isdigit() else 0
+        deleted = before_count - after_count
+
+    if deleted < 1:
+        return 0.0, f"Could not delete PG records (before={before_count}, after={after_count})"
+
+    # Trigger backup Job
+    job_name = f"grader-deleted-{ts}"
+    completed, logs, failed = trigger_backup_job(job_name)
+
+    logs_lower = logs.lower()
+
+    # The validation should detect MinIO has more objects than PG records
+    detected = any(w in logs_lower for w in [
+        "stale", "orphan", "mismatch", "inconsisten",
+        "minio has more", "more objects than records",
+        "extra object", "not in database", "not in pg",
+        "objects without record", "no matching record",
+    ])
+
+    # Check if the validation reports counts where MinIO > PG
+    minio_mentions = re.findall(r'minio[^0-9]*(\d+)', logs_lower)
+    pg_mentions = re.findall(r'pg[^0-9]*(\d+)', logs_lower)
+    if minio_mentions and pg_mentions:
+        max_minio = max(int(x) for x in minio_mentions)
+        max_pg = max(int(x) for x in pg_mentions)
+        if max_minio > max_pg:
+            detected = True
+
+    job_failed = failed.isdigit() and int(failed) > 0
+
+    if detected or job_failed:
+        return 1.0, f"Validation detected deleted PG records ({deleted} removed, MinIO still has objects)"
+    else:
+        return 0.0, f"Validation did NOT detect {deleted} deleted PG records. Logs: {logs[:300]}"
 
 
 # ─────────────────────────────────────────────
@@ -447,9 +399,9 @@ def grade(*args, **kwargs) -> GradingResult:
 
     checks = {
         "backup_script_has_minio": check_backup_script_has_minio,
-        "backup_handles_concurrent_writes": check_backup_handles_concurrent_writes,
         "validation_catches_orphans": check_validation_catches_orphans,
-        "backup_notifies_on_failure": check_backup_notifies_on_failure,
+        "backup_detects_stale_objects": check_backup_detects_stale_objects,
+        "backup_excludes_deleted_records": check_backup_excludes_deleted_records,
     }
 
     weight = 1.0 / len(checks)
