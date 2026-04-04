@@ -143,7 +143,7 @@ def cleanup_job(job_name):
 def get_status_doc():
     rc, out, _ = run_cmd(
         f"kubectl get configmap {STATUS_CONFIGMAP} -n glitchtip "
-        f"-o jsonpath='{{.data.{STATUS_KEY.replace('.', '\\\\.')}}}' 2>/dev/null"
+        f"-o go-template='{{{{ index .data \"{STATUS_KEY}\" }}}}' 2>/dev/null"
     )
     return out.strip("'") if rc == 0 else ""
 
