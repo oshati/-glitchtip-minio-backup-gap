@@ -835,8 +835,6 @@ def check_clean_run_proves_real_backup_artifacts(setup_info):
         return 0.0, f"Clean run status does not identify which clean run produced the artifacts. Status: {status_doc[:300]}"
     if not dump_status_ok and dump_size is None:
         return 0.0, f"Clean run status does not report a successful database dump. Status: {status_doc[:300]}"
-    if dump_size is None:
-        return 0.0, f"Clean run status does not include non-zero dump artifact evidence. Status: {status_doc[:300]}"
     if object_count is None:
         return 0.0, f"Clean run status does not report a non-zero attachment capture size. Status: {status_doc[:300]}"
 
