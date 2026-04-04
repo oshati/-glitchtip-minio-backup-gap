@@ -15,6 +15,8 @@ Objectives:
    - An object with no matching database record must fail closed and be reported.
 4. validation_catches_balanced_set_drift
    - Equal counts but mismatched sets must still fail closed and be reported.
+5. minio_access_remains_scoped
+   - Fixing the pipeline must not broaden MinIO access to arbitrary workloads.
 """
 
 import json
@@ -37,6 +39,7 @@ except ImportError:
 
 STATUS_CONFIGMAP = "glitchtip-backup-status"
 STATUS_KEY = "status.md"
+MINIO_ACCESS_POLICY = "glitchtip-minio-access-policy"
 
 
 def run_cmd(cmd, timeout=30):
@@ -138,6 +141,10 @@ def trigger_backup_job(job_name, wait_seconds=300):
 
 def cleanup_job(job_name):
     run_cmd(f"kubectl delete job {job_name} -n glitchtip --ignore-not-found=true >/dev/null 2>&1", timeout=20)
+
+
+def cleanup_pod(pod_name):
+    run_cmd(f"kubectl delete pod {pod_name} -n glitchtip --ignore-not-found=true >/dev/null 2>&1", timeout=20)
 
 
 def get_status_doc():
@@ -253,12 +260,42 @@ def record_text(logs, status_doc):
     return f"{logs}\n{status_doc}".lower()
 
 
-def has_line_with_tokens(text, expected_path, tokens):
+def extract_relevant_excerpt(text, expected_path="", window=6, fallback_lines=12):
+    lines = text.splitlines()
+    lowered_lines = [line.lower() for line in lines]
     expected = expected_path.lower()
-    for line in text.splitlines():
-        lowered = line.lower()
-        if expected in lowered and any(token in lowered for token in tokens):
-            return True
+
+    if expected:
+        for idx, line in enumerate(lowered_lines):
+            if expected in line:
+                start = max(0, idx - window)
+                end = min(len(lines), idx + window + 1)
+                return "\n".join(lines[start:end])
+
+    interesting = [
+        idx for idx, line in enumerate(lowered_lines)
+        if any(token in line for token in ["validation", "missing", "orphan", "extra", "result:", "status configmap"])
+    ]
+    if interesting:
+        start = max(0, interesting[0] - 2)
+        end = min(len(lines), interesting[0] + fallback_lines)
+        return "\n".join(lines[start:end])
+
+    return "\n".join(lines[:fallback_lines])
+
+
+def has_path_with_context_tokens(text, expected_path, tokens, window=6):
+    lines = text.splitlines()
+    lowered_lines = [line.lower() for line in lines]
+    expected = expected_path.lower()
+
+    for idx, line in enumerate(lowered_lines):
+        if expected in line:
+            start = max(0, idx - window)
+            end = min(len(lowered_lines), idx + window + 1)
+            context = "\n".join(lowered_lines[start:end])
+            if any(token in context for token in tokens):
+                return True
     return False
 
 
@@ -270,8 +307,16 @@ def evidence_for_forward_gap(text, expected_path):
         "database references missing",
         "referenced blob",
         "missing_in_object_storage",
+        "point to missing object",
+        "point at missing object",
+        "objects not found in object storage",
+        "objects not found in storage",
+        "record exists, object missing",
+        "dangling",
+        "missing:",
+        "missing object",
     ]
-    return has_line_with_tokens(text, expected_path, forward_keywords)
+    return has_path_with_context_tokens(text, expected_path, forward_keywords)
 
 
 def evidence_for_reverse_gap(text, expected_path):
@@ -281,8 +326,94 @@ def evidence_for_reverse_gap(text, expected_path):
         "no database record",
         "objects without record",
         "extra_in_object_storage",
+        "orphan",
+        "orphaned",
+        "no matching db record",
+        "no matching database record",
+        "object in storage have no",
+        "objects in storage have no",
+        "orphan:",
+        "orphaned:",
     ]
-    return has_line_with_tokens(text, expected_path, reverse_keywords)
+    return has_path_with_context_tokens(text, expected_path, reverse_keywords)
+
+
+def check_minio_access_remains_scoped(setup_info):
+    endpoint_host = extract_endpoint_host(setup_info)
+    if not endpoint_host:
+        endpoint_host = "glitchtip-minio"
+
+    rc, _, _ = run_cmd(
+        f"kubectl get networkpolicy {MINIO_ACCESS_POLICY} -n glitchtip "
+        "-o jsonpath='{.metadata.name}' 2>/dev/null",
+        timeout=20,
+    )
+    if rc != 0:
+        return 0.0, "Scoped MinIO access policy is missing"
+
+    ts = int(time.time())
+    probe_name = f"grader-minio-probe-{ts}"
+    cleanup_pod(probe_name)
+
+    rc, out, err = run_cmd(
+        f"""kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {probe_name}
+  namespace: glitchtip
+  labels:
+    app: grader-probe
+    component: minio-policy-check
+spec:
+  restartPolicy: Never
+  containers:
+  - name: probe
+    image: docker.io/minio/minio:latest
+    imagePullPolicy: IfNotPresent
+    command: ["/bin/sh", "-c", "sleep 600"]
+EOF""",
+        timeout=30,
+    )
+    if rc != 0:
+        return 0.0, f"Could not create unauthorized probe pod: {(err or out)[:200]}"
+
+    try:
+        ready = False
+        phase = ""
+        for _ in range(18):
+            rc, phase_out, _ = run_cmd(
+                f"kubectl get pod {probe_name} -n glitchtip -o jsonpath='{{.status.phase}}' 2>/dev/null",
+                timeout=20,
+            )
+            phase = phase_out.strip("'")
+            if phase == "Running":
+                ready = True
+                break
+            if phase in ("Failed", "Succeeded"):
+                return 0.0, f"Unauthorized probe pod exited early with phase {phase}"
+            time.sleep(5)
+
+        if not ready:
+            return 0.0, f"Unauthorized probe pod did not become ready (last phase: {phase or 'unknown'})"
+
+        rc, out, err = run_cmd(
+            f"kubectl exec -n glitchtip {probe_name} -- "
+            f"sh -c \"curl -sS -o /dev/null -w '%{{http_code}}' --connect-timeout 3 --max-time 6 "
+            f"http://{endpoint_host}:9000/minio/health/live\"",
+            timeout=20,
+        )
+    finally:
+        cleanup_pod(probe_name)
+
+    status_code = out.strip()
+    if rc == 0 and status_code == "200":
+        return 0.0, (
+            "Unauthorized in-cluster probe can still reach MinIO. "
+            "The fix broadened object-store exposure instead of preserving scoped access."
+        )
+
+    return 1.0, "MinIO access remains scoped to authorized workloads after the backup fix"
 
 
 def check_pipeline_handles_clean_and_drift_runs(setup_info):
@@ -303,7 +434,7 @@ def check_pipeline_handles_clean_and_drift_runs(setup_info):
     if clean_err:
         return 0.0, clean_err
     if not clean_completed or clean_failed_job:
-        return 0.0, f"Clean backup run did not succeed. Logs: {clean_logs[:300]}"
+        return 0.0, f"Clean backup run did not succeed. Logs:\n{extract_relevant_excerpt(clean_logs)}"
     if not clean_status or clean_marker in clean_status:
         return 0.0, "Clean backup run did not update the persistent status surface"
     if not status_has_success(clean_status):
@@ -331,15 +462,21 @@ def check_pipeline_handles_clean_and_drift_runs(setup_info):
     if drift_err:
         return 0.0, drift_err
     if not drift_failed_job:
-        return 0.0, f"Built-in live drift did not fail closed. Logs: {drift_logs[:300]}"
+        return 0.0, f"Built-in live drift did not fail closed. Logs:\n{extract_relevant_excerpt(drift_logs, expected_missing)}"
     if not drift_status or drift_marker in drift_status:
         return 0.0, "Dirty backup run did not update the persistent status surface"
     if not status_has_failure(drift_status):
         return 0.0, f"Dirty backup status does not indicate failure. Status: {drift_status[:300]}"
     if not evidence_for_forward_gap(drift_text, expected_missing):
-        return 0.0, f"Dirty run did not report the missing object side of the drift. Logs: {drift_logs[:300]}"
+        return 0.0, (
+            "Dirty run did not report the missing object side of the drift. "
+            f"Relevant excerpt:\n{extract_relevant_excerpt(drift_text, expected_missing)}"
+        )
     if not evidence_for_reverse_gap(drift_text, expected_stale):
-        return 0.0, f"Dirty run did not report the extra object side of the drift. Logs: {drift_logs[:300]}"
+        return 0.0, (
+            "Dirty run did not report the extra object side of the drift. "
+            f"Relevant excerpt:\n{extract_relevant_excerpt(drift_text, expected_stale)}"
+        )
 
     return 1.0, "Pipeline succeeds on clean data, fails on the built-in drift, and reports both states persistently"
 
@@ -378,11 +515,14 @@ def check_validation_catches_forward_gap(setup_info):
     if err:
         return 0.0, err
     if not job_failed:
-        return 0.0, f"Forward-gap validation did not fail closed. Logs: {logs[:300]}"
+        return 0.0, f"Forward-gap validation did not fail closed. Logs:\n{extract_relevant_excerpt(logs, orphan_key)}"
     if not status_doc or marker in status_doc or not status_has_failure(status_doc):
         return 0.0, f"Forward-gap run did not publish a failed status. Status: {status_doc[:300]}"
     if not evidence_for_forward_gap(text, orphan_key):
-        return 0.0, f"Forward-gap run did not report the missing object evidence. Logs: {logs[:300]}"
+        return 0.0, (
+            "Forward-gap run did not report the missing object evidence. "
+            f"Relevant excerpt:\n{extract_relevant_excerpt(text, orphan_key)}"
+        )
 
     return 1.0, "Validation fails closed and reports a database record with no matching object"
 
@@ -420,11 +560,14 @@ def check_validation_catches_reverse_gap(setup_info):
     if err:
         return 0.0, err
     if not job_failed:
-        return 0.0, f"Reverse-gap validation did not fail closed. Logs: {logs[:300]}"
+        return 0.0, f"Reverse-gap validation did not fail closed. Logs:\n{extract_relevant_excerpt(logs, extra_key)}"
     if not status_doc or marker in status_doc or not status_has_failure(status_doc):
         return 0.0, f"Reverse-gap run did not publish a failed status. Status: {status_doc[:300]}"
     if not evidence_for_reverse_gap(text, extra_key):
-        return 0.0, f"Reverse-gap run did not report the extra object evidence. Logs: {logs[:300]}"
+        return 0.0, (
+            "Reverse-gap run did not report the extra object evidence. "
+            f"Relevant excerpt:\n{extract_relevant_excerpt(text, extra_key)}"
+        )
 
     return 1.0, "Validation fails closed and reports an object with no matching database record"
 
@@ -474,11 +617,14 @@ def check_validation_catches_balanced_set_drift(setup_info):
     if err:
         return 0.0, err
     if not job_failed:
-        return 0.0, f"Balanced drift did not fail closed. Logs: {logs[:300]}"
+        return 0.0, f"Balanced drift did not fail closed. Logs:\n{extract_relevant_excerpt(logs, missing_key)}"
     if not status_doc or marker in status_doc or not status_has_failure(status_doc):
         return 0.0, f"Balanced drift run did not publish a failed status. Status: {status_doc[:300]}"
     if not (missing_reported and extra_reported):
-        return 0.0, f"Balanced drift was not reported as both missing and extra set drift. Logs: {logs[:300]}"
+        return 0.0, (
+            "Balanced drift was not reported as both missing and extra set drift. "
+            f"Relevant excerpt:\n{extract_relevant_excerpt(text, missing_key)}"
+        )
 
     return 1.0, "Validation catches equal-count set drift instead of relying on simple totals"
 
@@ -497,6 +643,7 @@ def grade(*args, **kwargs) -> GradingResult:
         "validation_catches_forward_gap": check_validation_catches_forward_gap,
         "validation_catches_reverse_gap": check_validation_catches_reverse_gap,
         "validation_catches_balanced_set_drift": check_validation_catches_balanced_set_drift,
+        "minio_access_remains_scoped": check_minio_access_remains_scoped,
     }
 
     weight = 1.0 / len(checks)

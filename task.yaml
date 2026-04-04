@@ -1,29 +1,24 @@
 id: null
 prompt: |
-  The platform team reran a quarterly disaster recovery drill for GlitchTip.
-  The latest backup note in-cluster still says the pipeline is healthy, but the
-  restore told a different story: issue detail pages with file attachments had
-  broken links, and a few symbolicated traces came back incomplete.
+  The platform team reran a quarterly restore drill for GlitchTip, and the
+  result was uncomfortable: the backup path has been reporting healthy for a
+  while, but the restored data did not line up with what people expected to
+  see in the app.
 
-  GlitchTip is still running in the existing namespace with PostgreSQL and
-  S3-compatible object storage. Someone already touched the backup pipeline a
-  while ago, so this is not just a missing `pg_dump` problem. Trace how the
-  attachment metadata and the object store line up, figure out why the backup
-  can still look green while restored data is wrong, and harden the pipeline so
-  it fails closed when those two sources drift.
+  This is not a brand-new backup pipeline. Someone has already worked on it,
+  and at a quick glance it can look fine. The problem is that a "green" run is
+  currently not a reliable signal that the system could actually be recovered
+  cleanly.
 
-  A clean backup run should still be able to complete, but mismatches must be
-  caught before the next drill. That includes records that point at missing
-  objects, leftover objects that no current record references, and cases where
-  simple totals still look fine even though the actual sets do not match.
+  Investigate the existing backup flow in the `glitchtip` namespace and make it
+  trustworthy again. A healthy run should still complete. A bad run should stop
+  itself instead of quietly producing a misleading result. There is already a
+  run-status note somewhere in the cluster, but it is stale enough that on-call
+  cannot trust it right now. Make the latest run state obvious there without
+  requiring someone to read pod logs.
 
-  There is already a persistent status surface for the backup pipeline in the
-  cluster, but it is stale and not trustworthy. Update the pipeline so the
-  latest run state is written there clearly enough for on-call to tell whether
-  a run succeeded or failed without digging through pod logs.
-
-  The GlitchTip and object-storage details should be discoverable from the
-  cluster secrets and ConfigMaps.
+  Keep the fix surgical. Do not solve this by broadly loosening storage access
+  or removing surrounding controls just to force a green backup.
 
 metadata:
   category: platform-eng
