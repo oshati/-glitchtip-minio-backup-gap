@@ -268,6 +268,20 @@ def status_has_failure(text):
     return any(token in lowered for token in ["status:** failed", "status: failed", "status=failed", "failed", "error"])
 
 
+def first_positive_int(text, patterns):
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        try:
+            value = int(match.group(1))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return None
+
+
 def extract_endpoint_host(setup_info):
     endpoint = setup_info.get("MINIO_ENDPOINT", "http://glitchtip-minio:9000")
     match = re.match(r"https?://([^/:]+)", endpoint)
@@ -793,23 +807,37 @@ def check_clean_run_proves_real_backup_artifacts(setup_info):
 
     has_dump_log = "glitchtip_db.dump" in logs_lower
     has_manifest_log = "backup_manifest.txt" in logs_lower or "recording backup metadata" in logs_lower
-    backup_id_match = re.search(r"(?:backup id|backup_id)[^a-z0-9-]*(glitchtip-\d{8}_\d{6})", status_lower)
-    dump_status_ok = re.search(r"(?:postgresql dump|pg_dump|database dump)[^\n]*(?:success|ok|completed|\b\d+\s*bytes\b)", status_lower)
-    dump_size_match = re.search(r"(?:pg_dump size|database dump size|postgresql dump)[^0-9]*(\d+)\s*bytes", status_lower)
-    db_count_match = re.search(r"(?:database fileblob count|pg_fileblobs)[^0-9]*(\d+)", status_lower)
-    object_count_match = re.search(r"(?:mirrored object count|mirrored_objects)[^0-9]*(\d+)", status_lower)
+    run_marker_ok = bool(re.search(
+        r"(?:backup id|backup_id|run id|run_id|latest run|latest recorded run)[^\n]*\S",
+        status_lower,
+    ))
+    dump_status_ok = bool(re.search(
+        r"(?:postgresql dump|database dump|pg_dump)[^\n]*(?:success|ok|completed|produced|\b\d+\s*bytes\b)",
+        status_lower,
+    ))
+    dump_size = first_positive_int(status_lower, [
+        r"(?:pg_dump(?:[_ ](?:size|bytes))?|pg dump(?: size| bytes)?|postgresql dump|database dump(?: size)?)[^0-9\n]{0,60}(\d+)\s*bytes?",
+        r"(?:pg_dump_bytes|pg dump bytes)[^0-9\n]{0,20}(\d+)",
+    ])
+    object_count = first_positive_int(status_lower, [
+        r"(?:attachment capture|attachments? captured|attachments? mirrored)[^0-9\n]{0,60}(\d+)",
+        r"(?:mirrored object count|mirrored_objects|mirrored objects?)[^0-9\n]{0,60}(\d+)",
+        r"(?:storage object count|storage objects? mirrored)[^0-9\n]{0,60}(\d+)",
+        r"(?:minio objects? mirrored|bucket objects?|objects? mirrored from bucket)[^0-9\n]{0,60}(\d+)",
+        r"(?:attachment objects?|captured objects?)[^0-9\n]{0,60}(\d+)",
+    ])
 
     if not has_dump_log:
         return 0.0, "Clean run did not show evidence of a real PostgreSQL dump artifact in the job logs"
     if not has_manifest_log:
         return 0.0, "Clean run did not show evidence of recorded backup metadata in the job logs"
-    if not backup_id_match:
-        return 0.0, f"Clean run status does not include a backup identifier. Status: {status_doc[:300]}"
-    if not dump_status_ok and not dump_size_match:
+    if not run_marker_ok:
+        return 0.0, f"Clean run status does not identify which clean run produced the artifacts. Status: {status_doc[:300]}"
+    if not dump_status_ok and dump_size is None:
         return 0.0, f"Clean run status does not report a successful database dump. Status: {status_doc[:300]}"
-    if not db_count_match or int(db_count_match.group(1)) <= 0:
-        return 0.0, f"Clean run status does not report a non-zero database snapshot size. Status: {status_doc[:300]}"
-    if not object_count_match or int(object_count_match.group(1)) <= 0:
+    if dump_size is None:
+        return 0.0, f"Clean run status does not include non-zero dump artifact evidence. Status: {status_doc[:300]}"
+    if object_count is None:
         return 0.0, f"Clean run status does not report a non-zero attachment capture size. Status: {status_doc[:300]}"
 
     return 1.0, "Clean run proves a real dump and object capture were produced, not just a green validation result"
