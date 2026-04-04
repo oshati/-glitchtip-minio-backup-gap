@@ -16,6 +16,11 @@ prompt: |
   fix the backup pipeline so this doesn't happen again? There should also be some
   kind of validation step that catches this sort of gap before it becomes a problem.
 
+  Also, when we had that TLS incident last quarter, nobody knew the backup had
+  failed until the DR drill. The backup pipeline should report its status
+  somewhere persistent so the on-call team can tell if a run failed without
+  having to dig through pod logs.
+
   The MinIO and GlitchTip credentials should be discoverable from the cluster
   secrets and ConfigMaps.
 

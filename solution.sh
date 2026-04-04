@@ -39,8 +39,28 @@ metadata:
 data:
   backup.sh: |
     #!/bin/sh
-    set -e
-    echo "[backup] Starting GlitchTip MinIO backup..."
+    BACKUP_STATUS="success"
+    BACKUP_MSG=""
+    trap 'report_status' EXIT
+
+    report_status() {
+      # Write backup status to a ConfigMap for monitoring
+      TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)
+      CACERT=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+      TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      PATCH="{\"data\":{\"last-run\":\"${TIMESTAMP}\",\"last-status\":\"${BACKUP_STATUS}\",\"last-message\":\"${BACKUP_MSG}\"}}"
+      if [ -n "${TOKEN}" ]; then
+        curl -sf --cacert ${CACERT} \
+          -X PATCH \
+          -H "Authorization: Bearer ${TOKEN}" \
+          -H "Content-Type: application/merge-patch+json" \
+          -d "${PATCH}" \
+          "https://kubernetes.default.svc/api/v1/namespaces/glitchtip/configmaps/glitchtip-backup-status" >/dev/null 2>&1 || true
+      fi
+      echo "[backup] status=${BACKUP_STATUS} result=backup_status=${BACKUP_STATUS} message=${BACKUP_MSG}"
+    }
+
+    echo "[backup] Starting GlitchTip backup..."
 
     # PostgreSQL dump done by init container
     if [ -f /backups/glitchtip_db.dump ]; then
@@ -51,7 +71,13 @@ data:
 
     # MinIO bucket backup
     echo "[backup] Backing up MinIO attachment bucket..."
-    mc alias set glitchtip-store http://glitchtip-minio:9000 "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" >/dev/null 2>&1
+    if ! mc alias set glitchtip-store http://glitchtip-minio:9000 "${MINIO_ACCESS_KEY}" "${MINIO_SECRET_KEY}" >/dev/null 2>&1; then
+      BACKUP_STATUS="failed"
+      BACKUP_MSG="MinIO alias setup failed — connection or credentials error"
+      echo "[backup] VALIDATION FAILED: ${BACKUP_MSG}"
+      exit 1
+    fi
+
     mc mirror glitchtip-store/glitchtip-attachments /backups/minio-attachments/ 2>&1
     MINIO_OBJECTS=$(mc ls --recursive glitchtip-store/glitchtip-attachments/ 2>/dev/null | wc -l)
     echo "[backup] MinIO backup complete: ${MINIO_OBJECTS} objects mirrored."
@@ -64,17 +90,56 @@ data:
 
     if [ "${PG_COUNT}" -gt "${MINIO_OBJECTS}" ]; then
       DIFF=$((PG_COUNT - MINIO_OBJECTS))
-      echo "[backup] VALIDATION FAILED: PG has ${PG_COUNT} records but MinIO only has ${MINIO_OBJECTS} objects — ${DIFF} missing!"
+      BACKUP_STATUS="failed"
+      BACKUP_MSG="PG has ${PG_COUNT} records but MinIO only has ${MINIO_OBJECTS} objects — ${DIFF} missing"
+      echo "[backup] VALIDATION FAILED: ${BACKUP_MSG}"
       exit 1
     fi
 
     if [ "${MINIO_OBJECTS}" -eq 0 ]; then
-      echo "[backup] VALIDATION FAILED: MinIO has 0 objects — bucket may be empty or unreachable"
+      BACKUP_STATUS="failed"
+      BACKUP_MSG="MinIO has 0 objects — bucket may be empty or unreachable"
+      echo "[backup] VALIDATION FAILED: ${BACKUP_MSG}"
       exit 1
     fi
 
-    echo "[backup] Backup and validation complete. PG=${PG_COUNT}, MinIO=${MINIO_OBJECTS} — consistent."
+    BACKUP_MSG="PG=${PG_COUNT}, MinIO=${MINIO_OBJECTS} — consistent"
+    echo "[backup] Backup and validation complete. ${BACKUP_MSG}"
 SCRIPT_EOF
+
+echo "[solution] Step 2b: Creating ServiceAccount for backup status reporting..."
+
+kubectl apply -f - <<'SA_EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: glitchtip-backup-sa
+  namespace: glitchtip
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: backup-status-writer
+  namespace: glitchtip
+rules:
+- apiGroups: [""]
+  resources: ["configmaps"]
+  verbs: ["get", "patch", "update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: backup-status-binding
+  namespace: glitchtip
+subjects:
+- kind: ServiceAccount
+  name: glitchtip-backup-sa
+  namespace: glitchtip
+roleRef:
+  kind: Role
+  name: backup-status-writer
+  apiGroup: rbac.authorization.k8s.io
+SA_EOF
 
 echo "[solution] Step 3: Updating CronJob with pg17 init + mc main container..."
 
@@ -101,6 +166,7 @@ spec:
             app: glitchtip
             job: backup
         spec:
+          serviceAccountName: glitchtip-backup-sa
           restartPolicy: Never
           volumes:
           - name: backup-script
