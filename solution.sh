@@ -7,10 +7,11 @@ kubectl get cronjob glitchtip-backup -n glitchtip >/dev/null
 kubectl get configmap glitchtip-backup-script -n glitchtip >/dev/null
 kubectl get configmap glitchtip-backup-script-original -n glitchtip >/dev/null
 kubectl get configmap glitchtip-backup-runtime-original -n glitchtip >/dev/null
+kubectl get configmap glitchtip-backup-restore-handoff -n glitchtip >/dev/null
 kubectl get cronjob glitchtip-backup-template-manager -n glitchtip >/dev/null
 
 echo "[solution] Current incident: both the backup script and the backup runtime identity are reconciled through compliance baselines."
-echo "[solution] Writing a replacement script that performs exact set and content-integrity validation and reports the latest run state."
+echo "[solution] Writing a replacement script that performs exact set and content-integrity validation and refreshes both the operator note and restore handoff."
 
 cat > /tmp/glitchtip-backup-fixed.sh <<'SCRIPT_EOF'
 #!/bin/bash
@@ -31,16 +32,34 @@ MISSING_COUNT=0
 EXTRA_COUNT=0
 INTEGRITY_MISMATCH_COUNT=0
 PG_DUMP_STATUS="not-started"
+PG_DUMP_BYTES=0
+VALIDATION_MODE="exact-set-and-integrity-match"
 
 json_escape() {
   sed ':a;N;$!ba;s/\\/\\\\/g;s/"/\\"/g;s/\n/\\n/g' | sed 's/^/"/;s/$/"/'
 }
 
-report_status() {
-  local token cacert namespace timestamp_now body payload
+patch_configmap_key() {
+  local configmap_name="$1"
+  local configmap_key="$2"
+  local configmap_value="$3"
+  local token cacert namespace payload
+
   token=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
   cacert=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
   namespace=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo glitchtip)
+  payload="{\"data\":{\"${configmap_key}\":${configmap_value}}}"
+
+  curl -sf --cacert "${cacert}" \
+    -X PATCH \
+    -H "Authorization: Bearer ${token}" \
+    -H "Content-Type: application/merge-patch+json" \
+    -d "${payload}" \
+    "https://kubernetes.default.svc/api/v1/namespaces/${namespace}/configmaps/${configmap_name}" >/dev/null
+}
+
+report_status() {
+  local timestamp_now body
   timestamp_now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
   body=$(cat <<EOF | json_escape
@@ -64,21 +83,64 @@ ${STATUS_DETAILS}
 EOF
 )
 
-  payload="{\"data\":{\"status.md\":${body}}}"
+  patch_configmap_key "glitchtip-backup-status" "status.md" "${body}"
+}
 
-  curl -sf --cacert "${cacert}" \
-    -X PATCH \
-    -H "Authorization: Bearer ${token}" \
-    -H "Content-Type: application/merge-patch+json" \
-    -d "${payload}" \
-    "https://kubernetes.default.svc/api/v1/namespaces/${namespace}/configmaps/glitchtip-backup-status" >/dev/null
+report_handoff() {
+  local timestamp_now result_json reason_json body safe_for_restore blocked
+  timestamp_now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  if [ "${RUN_STATUS}" = "SUCCESS" ]; then
+    safe_for_restore=true
+    blocked=false
+    result_json="success"
+  else
+    safe_for_restore=false
+    blocked=true
+    result_json="failed"
+  fi
+
+  reason_json=$(printf '%s' "${STATUS_DETAILS}" | json_escape)
+
+  body=$(cat <<EOF | json_escape
+{
+  "latest_run": "${timestamp_now}",
+  "backup_id": "glitchtip-${TIMESTAMP}",
+  "result": "${result_json}",
+  "safe_for_restore": ${safe_for_restore},
+  "blocked": ${blocked},
+  "pg_dump": {
+    "status": "${PG_DUMP_STATUS}",
+    "bytes": ${PG_DUMP_BYTES}
+  },
+  "attachments": {
+    "database_fileblobs": ${DB_FILEBLOB_COUNT},
+    "mirrored_objects": ${MIRRORED_OBJECT_COUNT}
+  },
+  "validation": {
+    "mode": "${VALIDATION_MODE}",
+    "missing_in_object_storage": ${MISSING_COUNT},
+    "extra_in_object_storage": ${EXTRA_COUNT},
+    "integrity_mismatches": ${INTEGRITY_MISMATCH_COUNT}
+  },
+  "reason": ${reason_json}
+}
+EOF
+)
+
+  patch_configmap_key "glitchtip-backup-restore-handoff" "handoff.json" "${body}"
+}
+
+publish_cluster_records() {
+  report_status
+  report_handoff
 }
 
 fail_backup() {
   RUN_STATUS="FAILED"
   STATUS_DETAILS="$1"
   echo "[backup] VALIDATION FAILED: ${STATUS_DETAILS}"
-  report_status
+  publish_cluster_records
   exit 1
 }
 
@@ -87,7 +149,7 @@ handle_error() {
   if [ "${RUN_STATUS}" != "SUCCESS" ]; then
     STATUS_DETAILS="- Backup failed during step: ${CURRENT_STEP}"
     echo "[backup] ERROR: ${STATUS_DETAILS}"
-    report_status || true
+    publish_cluster_records || true
   fi
   exit 1
 }
@@ -102,6 +164,7 @@ echo "[backup] Step 1/4: Dumping PostgreSQL database..."
 PGPASSWORD="${PGPASSWORD}" pg_dump -h glitchtip-postgresql -U postgres -d postgres \
   --format=custom --file="${BACKUP_DIR}/glitchtip_db.dump"
 PG_DUMP_STATUS="success"
+PG_DUMP_BYTES=$(wc -c < "${BACKUP_DIR}/glitchtip_db.dump" | tr -d '[:space:]')
 echo "[backup] PostgreSQL dump complete: ${BACKUP_DIR}/glitchtip_db.dump"
 
 CURRENT_STEP="mirror-object-storage"
@@ -198,7 +261,7 @@ STATUS_DETAILS="- PostgreSQL dump: success
 - missing_in_object_storage=0
 - extra_in_object_storage=0
 - integrity_mismatches=0"
-report_status
+publish_cluster_records
 
 echo "[backup] Validation passed: exact database/object-store sets and object bytes match"
 echo "[backup] Backup complete."
@@ -220,7 +283,7 @@ metadata:
 rules:
 - apiGroups: [""]
   resources: ["configmaps"]
-  resourceNames: ["glitchtip-backup-status"]
+  resourceNames: ["glitchtip-backup-status", "glitchtip-backup-restore-handoff"]
   verbs: ["get", "patch", "update"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

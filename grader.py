@@ -7,12 +7,14 @@ It is "does the backup pipeline behave correctly on both clean and dirty data?".
 
 Objectives:
 1. pipeline_handles_clean_and_drift_runs
-   - A clean run must succeed and update the persistent status surface.
+   - A clean run must succeed and update both the persistent status note and
+     machine-readable restore handoff.
    - The built-in live drift scenario must fail, report both sides of the drift,
-     and preserve scoped MinIO access.
+     mark restore handoff unsafe, and preserve scoped MinIO access.
 2. clean_run_proves_real_backup_artifacts
    - A clean run must show evidence that a real dump and object capture were
-     produced, not just that validation passed.
+     produced, not just that validation passed, and refresh downstream restore
+     handoff details.
 3. validation_catches_all_drift_modes
    - Forward gap, reverse gap, equal-count set drift, and wrong-bytes integrity
      drift must all fail closed and be reported. Partial drift handling does
@@ -40,6 +42,9 @@ except ImportError:
 
 STATUS_CONFIGMAP = "glitchtip-backup-status"
 STATUS_KEY = "status.md"
+HANDOFF_CONFIGMAP = "glitchtip-backup-restore-handoff"
+HANDOFF_KEY = "handoff.json"
+RUNTIME_CONFIGMAP_TARGETS = {STATUS_CONFIGMAP, HANDOFF_CONFIGMAP}
 MINIO_ACCESS_POLICY = "glitchtip-minio-access-policy"
 
 
@@ -168,6 +173,14 @@ def get_status_doc():
     return out.strip("'") if rc == 0 else ""
 
 
+def get_handoff_doc():
+    rc, out, _ = run_cmd(
+        f"kubectl get configmap {HANDOFF_CONFIGMAP} -n glitchtip "
+        f"-o go-template='{{{{ index .data \"{HANDOFF_KEY}\" }}}}' 2>/dev/null"
+    )
+    return out.strip("'") if rc == 0 else ""
+
+
 def get_backup_service_account():
     rc, out, _ = run_cmd(
         "kubectl get cronjob glitchtip-backup -n glitchtip "
@@ -191,6 +204,16 @@ def set_status_doc(text):
     payload = json.dumps({"data": {STATUS_KEY: text}})
     rc, _, err = run_cmd(
         f"kubectl patch configmap {STATUS_CONFIGMAP} -n glitchtip "
+        f"--type merge -p {shlex.quote(payload)}",
+        timeout=20,
+    )
+    return rc == 0, err
+
+
+def set_handoff_doc(text):
+    payload = json.dumps({"data": {HANDOFF_KEY: text}})
+    rc, _, err = run_cmd(
+        f"kubectl patch configmap {HANDOFF_CONFIGMAP} -n glitchtip "
         f"--type merge -p {shlex.quote(payload)}",
         timeout=20,
     )
@@ -249,13 +272,21 @@ def remove_fileblob_rows(pg_pod, blob_path, setup_info):
     )
 
 
-def wait_for_status_change(marker, timeout_seconds=60):
+def wait_for_doc_change(getter, marker, timeout_seconds=60):
     for _ in range(int(timeout_seconds / 5)):
-        current = get_status_doc()
+        current = getter()
         if current and marker not in current:
             return current
         time.sleep(5)
-    return get_status_doc()
+    return getter()
+
+
+def wait_for_status_change(marker, timeout_seconds=60):
+    return wait_for_doc_change(get_status_doc, marker, timeout_seconds=timeout_seconds)
+
+
+def wait_for_handoff_change(marker, timeout_seconds=60):
+    return wait_for_doc_change(get_handoff_doc, marker, timeout_seconds=timeout_seconds)
 
 
 def status_has_success(text):
@@ -280,6 +311,111 @@ def first_positive_int(text, patterns):
         if value > 0:
             return value
     return None
+
+
+def handoff_is_machine_readable(text):
+    stripped = text.strip()
+    if not stripped:
+        return False
+
+    try:
+        parsed = json.loads(stripped)
+        if isinstance(parsed, dict):
+            return True
+    except Exception:
+        pass
+
+    kv_lines = [
+        line for line in stripped.splitlines()
+        if re.search(r"^\s*[A-Za-z0-9_.-]+\s*[:=]\s*.+$", line)
+    ]
+    return len(kv_lines) >= 3
+
+
+def handoff_has_success(text):
+    lowered = text.lower()
+    patterns = [
+        r"safe(?:_for_restore| for restore)?[\"'\s:=]+(?:true|yes|1)",
+        r"restore(?:_ready| ready)?[\"'\s:=]+(?:true|yes|1)",
+        r"result[\"'\s:=]+success",
+        r"status[\"'\s:=]+success",
+    ]
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def handoff_has_failure(text):
+    lowered = text.lower()
+    patterns = [
+        r"safe(?:_for_restore| for restore)?[\"'\s:=]+(?:false|no|0)",
+        r"restore(?:_ready| ready)?[\"'\s:=]+(?:false|no|0)",
+        r"unsafe(?:_for_restore| for restore)?[\"'\s:=]+(?:true|yes|1)",
+        r"blocked[\"'\s:=]+(?:true|yes|1)",
+        r"result[\"'\s:=]+(?:failed|failure|blocked|unsafe)",
+        r"status[\"'\s:=]+(?:failed|failure|blocked|unsafe)",
+    ]
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def handoff_has_run_identity(text):
+    lowered = text.lower()
+    return bool(re.search(
+        r"(?:backup[_ -]?id|run[_ -]?id|latest[_ -]?run|timestamp|completed[_ -]?at|created[_ -]?at)"
+        r"[^\n]{0,80}(?:glitchtip-\d{8}_\d{6}|\d{8}_\d{6}|\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}z)",
+        lowered,
+    ))
+
+
+def handoff_dump_bytes(text):
+    return first_positive_int(text.lower(), [
+        r"(?:pg_dump|dump_bytes|dump size|dump_size|postgresql dump|database dump)[^0-9\n]{0,60}(\d+)",
+    ])
+
+
+def handoff_object_count(text):
+    return first_positive_int(text.lower(), [
+        r"(?:attachments?|objects?|minio objects?|bucket objects?|captured_objects|verified_objects|mirrored_objects)"
+        r"[^0-9\n]{0,60}(\d+)",
+    ])
+
+
+def handoff_has_validation_details(text):
+    lowered = text.lower()
+    patterns = [
+        r"validation(?:_mode)?[\"'\s:=]+(?:exact|set|integrity|verified|matched)",
+        r"missing(?:_in_object_storage)?[\"'\s:=]+\d+",
+        r"extra(?:_in_object_storage)?[\"'\s:=]+\d+",
+        r"integrity(?:_mismatches?)?[\"'\s:=]+\d+",
+        r"reason[\"'\s:=]+.+",
+        r"blocked_reason[\"'\s:=]+.+",
+    ]
+    return any(re.search(pattern, lowered) for pattern in patterns)
+
+
+def validate_handoff_doc(handoff_doc, marker, expect_success, require_artifact_details=False, require_reason=False):
+    if not handoff_doc or marker in handoff_doc:
+        return False, "Backup run did not update the machine-readable restore handoff surface"
+    if not handoff_is_machine_readable(handoff_doc):
+        return False, (
+            "Restore handoff was updated, but it is not machine-readable enough for downstream tooling "
+            "to consume reliably."
+        )
+    if expect_success and not handoff_has_success(handoff_doc):
+        return False, f"Restore handoff does not mark the latest run as safe/successful. Handoff: {handoff_doc[:300]}"
+    if not expect_success and not handoff_has_failure(handoff_doc):
+        return False, f"Restore handoff does not mark the latest run as blocked/unsafe. Handoff: {handoff_doc[:300]}"
+    if require_artifact_details:
+        if not handoff_has_run_identity(handoff_doc):
+            return False, f"Restore handoff does not identify which run produced the latest backup artifacts. Handoff: {handoff_doc[:300]}"
+        if handoff_dump_bytes(handoff_doc) is None:
+            return False, f"Restore handoff does not report non-zero dump artifact evidence. Handoff: {handoff_doc[:300]}"
+        if handoff_object_count(handoff_doc) is None:
+            return False, f"Restore handoff does not report a non-zero attachment capture count. Handoff: {handoff_doc[:300]}"
+    if require_reason and not handoff_has_validation_details(handoff_doc):
+        return False, (
+            "Restore handoff does not explain why the latest run is blocked or how validation was evaluated. "
+            f"Handoff: {handoff_doc[:300]}"
+        )
+    return True, ""
 
 
 def extract_endpoint_host(setup_info):
@@ -470,8 +606,8 @@ def verify_live_incident_untouched(setup_info):
     )
 
 
-def record_text(logs, status_doc):
-    return f"{logs}\n{status_doc}".lower()
+def record_text(logs, status_doc, handoff_doc=""):
+    return f"{logs}\n{status_doc}\n{handoff_doc}".lower()
 
 
 def extract_relevant_excerpt(text, expected_path="", window=6, fallback_lines=12):
@@ -673,8 +809,8 @@ def verify_backup_runtime_permissions_remain_scoped():
     if not sa_name:
         return False, (
             "Backup CronJob does not declare a dedicated runtime identity. "
-            "The job should use a reconciled service account that can publish status without "
-            "having broad maintenance write access."
+            "The job should use a reconciled service account that can publish the run note "
+            "and restore handoff without having broad maintenance write access."
         )
 
     rolebindings, err = get_kubectl_json("kubectl get rolebindings -n glitchtip -o json", timeout=30)
@@ -745,13 +881,17 @@ def verify_backup_runtime_permissions_remain_scoped():
         resource_names = rule.get("resourceNames")
         if resource_names is None or "*" in resource_names:
             return True
-        return set(resource_names) != {STATUS_CONFIGMAP}
+        return not set(resource_names).issubset(RUNTIME_CONFIGMAP_TARGETS)
 
     def rule_can_patch_backup_cronjob(rule):
         return rule_allows(rule, "batch", "cronjobs", ["patch", "update"], "glitchtip-backup")
 
     can_patch_status = any(
         rule_allows(rule, "", "configmaps", ["patch", "update"], STATUS_CONFIGMAP)
+        for rule in bound_rules
+    )
+    can_patch_handoff = any(
+        rule_allows(rule, "", "configmaps", ["patch", "update"], HANDOFF_CONFIGMAP)
         for rule in bound_rules
     )
     has_broad_config_access = any(rule_is_broad_config_writer(rule) for rule in bound_rules)
@@ -762,16 +902,21 @@ def verify_backup_runtime_permissions_remain_scoped():
             f"Backup runtime identity '{sa_name}' cannot publish the run-status note. "
             "It needs narrow write access to the status ConfigMap."
         )
+    if not can_patch_handoff:
+        return False, (
+            f"Backup runtime identity '{sa_name}' cannot refresh the machine-readable restore handoff. "
+            "It needs narrow write access to the restore-handoff ConfigMap."
+        )
 
     if has_broad_config_access or can_patch_backup_cronjob:
         return False, (
             f"Backup runtime identity '{sa_name}' is too broad. "
-            "It can rewrite backup configuration instead of only publishing status."
+            "It can rewrite backup configuration instead of only publishing the run note and restore handoff."
         )
 
     return True, (
-        f"Backup runtime identity '{sa_name}' can publish status without having broad "
-        "write access to the backup configuration."
+        f"Backup runtime identity '{sa_name}' can publish the run note and restore handoff "
+        "without having broad write access to the backup configuration."
     )
 
 
@@ -783,10 +928,12 @@ def check_clean_run_proves_real_backup_artifacts(setup_info):
     ts = int(time.time())
     marker = f"GRADER-ARTIFACT-{ts}"
     set_status_doc(marker)
+    set_handoff_doc(marker)
 
     job_name = f"grader-artifact-{ts}"
     completed, logs, failed, err = trigger_backup_job(job_name)
     status_doc = wait_for_status_change(marker)
+    handoff_doc = wait_for_handoff_change(marker)
     cleanup_job(job_name)
 
     job_failed = failed.isdigit() and int(failed) > 0
@@ -801,6 +948,15 @@ def check_clean_run_proves_real_backup_artifacts(setup_info):
         return 0.0, "Clean artifact-evidence run did not update the persistent status surface"
     if not status_has_success(status_doc):
         return 0.0, f"Clean artifact-evidence status does not indicate success. Status: {status_doc[:300]}"
+    handoff_ok, handoff_feedback = validate_handoff_doc(
+        handoff_doc,
+        marker,
+        expect_success=True,
+        require_artifact_details=True,
+        require_reason=True,
+    )
+    if not handoff_ok:
+        return 0.0, handoff_feedback
     runtime_ok, runtime_feedback = verify_backup_runtime_permissions_remain_scoped()
     if not runtime_ok:
         return 0.0, runtime_feedback
@@ -838,7 +994,10 @@ def check_clean_run_proves_real_backup_artifacts(setup_info):
     if object_count is None:
         return 0.0, f"Clean run status does not report a non-zero attachment capture size. Status: {status_doc[:300]}"
 
-    return 1.0, "Clean run proves a real dump and object capture were produced, not just a green validation result"
+    return 1.0, (
+        "Clean run proves a real dump and object capture were produced, and it refreshes "
+        "the machine-readable restore handoff for downstream recovery tooling"
+    )
 
 
 def check_pipeline_handles_clean_and_drift_runs(setup_info):
@@ -849,10 +1008,12 @@ def check_pipeline_handles_clean_and_drift_runs(setup_info):
     ts = int(time.time())
     clean_marker = f"GRADER-CLEAN-{ts}"
     set_status_doc(clean_marker)
+    set_handoff_doc(clean_marker)
 
     clean_job = f"grader-clean-{ts}"
     clean_completed, clean_logs, clean_failed, clean_err = trigger_backup_job(clean_job)
     clean_status = wait_for_status_change(clean_marker)
+    clean_handoff = wait_for_handoff_change(clean_marker)
     cleanup_job(clean_job)
 
     clean_failed_job = clean_failed.isdigit() and int(clean_failed) > 0
@@ -864,6 +1025,15 @@ def check_pipeline_handles_clean_and_drift_runs(setup_info):
         return 0.0, "Clean backup run did not update the persistent status surface"
     if not status_has_success(clean_status):
         return 0.0, f"Clean backup status does not indicate success. Status: {clean_status[:300]}"
+    handoff_ok, handoff_feedback = validate_handoff_doc(
+        clean_handoff,
+        clean_marker,
+        expect_success=True,
+        require_artifact_details=True,
+        require_reason=True,
+    )
+    if not handoff_ok:
+        return 0.0, handoff_feedback
     runtime_ok, runtime_feedback = verify_backup_runtime_permissions_remain_scoped()
     if not runtime_ok:
         return 0.0, runtime_feedback
@@ -874,16 +1044,18 @@ def check_pipeline_handles_clean_and_drift_runs(setup_info):
 
     drift_marker = f"GRADER-DRIFT-{ts}"
     set_status_doc(drift_marker)
+    set_handoff_doc(drift_marker)
 
     drift_job = f"grader-drift-{ts}"
     drift_completed, drift_logs, drift_failed, drift_err = trigger_backup_job(drift_job)
     drift_status = wait_for_status_change(drift_marker)
+    drift_handoff = wait_for_handoff_change(drift_marker)
     cleanup_job(drift_job)
 
     ensure_consistent_dataset(setup_info)
 
     drift_failed_job = drift_failed.isdigit() and int(drift_failed) > 0
-    drift_text = record_text(drift_logs, drift_status)
+    drift_text = record_text(drift_logs, drift_status, drift_handoff)
     expected_missing = setup_info.get("LIVE_MISSING_BLOB", "")
     expected_stale = setup_info.get("LIVE_STALE_BLOB", "")
 
@@ -895,6 +1067,14 @@ def check_pipeline_handles_clean_and_drift_runs(setup_info):
         return 0.0, "Dirty backup run did not update the persistent status surface"
     if not status_has_failure(drift_status):
         return 0.0, f"Dirty backup status does not indicate failure. Status: {drift_status[:300]}"
+    handoff_ok, handoff_feedback = validate_handoff_doc(
+        drift_handoff,
+        drift_marker,
+        expect_success=False,
+        require_reason=True,
+    )
+    if not handoff_ok:
+        return 0.0, handoff_feedback
     if not evidence_for_forward_gap(drift_text, expected_missing):
         return 0.0, (
             "Dirty run did not report the missing object side of the drift. "
@@ -912,7 +1092,10 @@ def check_pipeline_handles_clean_and_drift_runs(setup_info):
     if not scoped_ok:
         return 0.0, scoped_feedback
 
-    return 1.0, "Pipeline succeeds on clean data, fails on live drift, reports both mismatch directions, and keeps MinIO access scoped"
+    return 1.0, (
+        "Pipeline succeeds on clean data, fails on live drift, keeps the restore handoff truthful, "
+        "reports both mismatch directions, and keeps MinIO access scoped"
+    )
 
 
 def check_validation_catches_forward_gap(setup_info):
@@ -936,15 +1119,17 @@ def check_validation_catches_forward_gap(setup_info):
 
     marker = f"GRADER-FWD-{ts}"
     set_status_doc(marker)
+    set_handoff_doc(marker)
 
     job_name = f"grader-forward-{ts}"
     completed, logs, failed, err = trigger_backup_job(job_name)
     status_doc = wait_for_status_change(marker)
+    handoff_doc = wait_for_handoff_change(marker)
     cleanup_job(job_name)
     ensure_consistent_dataset(setup_info)
 
     job_failed = failed.isdigit() and int(failed) > 0
-    text = record_text(logs, status_doc)
+    text = record_text(logs, status_doc, handoff_doc)
 
     if err:
         return 0.0, err
@@ -952,6 +1137,14 @@ def check_validation_catches_forward_gap(setup_info):
         return 0.0, f"Forward-gap validation did not fail closed. Logs:\n{extract_relevant_excerpt(logs, orphan_key)}"
     if not status_doc or marker in status_doc or not status_has_failure(status_doc):
         return 0.0, f"Forward-gap run did not publish a failed status. Status: {status_doc[:300]}"
+    handoff_ok, handoff_feedback = validate_handoff_doc(
+        handoff_doc,
+        marker,
+        expect_success=False,
+        require_reason=True,
+    )
+    if not handoff_ok:
+        return 0.0, handoff_feedback
     if not evidence_for_forward_gap(text, orphan_key):
         return 0.0, (
             "Forward-gap run did not report the missing object evidence. "
@@ -984,15 +1177,17 @@ def check_validation_catches_reverse_gap(setup_info):
 
     marker = f"GRADER-REV-{ts}"
     set_status_doc(marker)
+    set_handoff_doc(marker)
 
     job_name = f"grader-reverse-{ts}"
     completed, logs, failed, err = trigger_backup_job(job_name)
     status_doc = wait_for_status_change(marker)
+    handoff_doc = wait_for_handoff_change(marker)
     cleanup_job(job_name)
     ensure_consistent_dataset(setup_info)
 
     job_failed = failed.isdigit() and int(failed) > 0
-    text = record_text(logs, status_doc)
+    text = record_text(logs, status_doc, handoff_doc)
 
     if err:
         return 0.0, err
@@ -1000,6 +1195,14 @@ def check_validation_catches_reverse_gap(setup_info):
         return 0.0, f"Reverse-gap validation did not fail closed. Logs:\n{extract_relevant_excerpt(logs, extra_key)}"
     if not status_doc or marker in status_doc or not status_has_failure(status_doc):
         return 0.0, f"Reverse-gap run did not publish a failed status. Status: {status_doc[:300]}"
+    handoff_ok, handoff_feedback = validate_handoff_doc(
+        handoff_doc,
+        marker,
+        expect_success=False,
+        require_reason=True,
+    )
+    if not handoff_ok:
+        return 0.0, handoff_feedback
     if not evidence_for_reverse_gap(text, extra_key):
         return 0.0, (
             "Reverse-gap run did not report the extra object evidence. "
@@ -1042,15 +1245,17 @@ def check_validation_catches_balanced_set_drift(setup_info):
 
     marker = f"GRADER-BAL-{ts}"
     set_status_doc(marker)
+    set_handoff_doc(marker)
 
     job_name = f"grader-balanced-{ts}"
     completed, logs, failed, err = trigger_backup_job(job_name)
     status_doc = wait_for_status_change(marker)
+    handoff_doc = wait_for_handoff_change(marker)
     cleanup_job(job_name)
     ensure_consistent_dataset(setup_info)
 
     job_failed = failed.isdigit() and int(failed) > 0
-    text = record_text(logs, status_doc)
+    text = record_text(logs, status_doc, handoff_doc)
     missing_reported = evidence_for_forward_gap(text, missing_key)
     extra_reported = evidence_for_reverse_gap(text, extra_key)
 
@@ -1060,6 +1265,14 @@ def check_validation_catches_balanced_set_drift(setup_info):
         return 0.0, f"Balanced drift did not fail closed. Logs:\n{extract_relevant_excerpt(logs, missing_key)}"
     if not status_doc or marker in status_doc or not status_has_failure(status_doc):
         return 0.0, f"Balanced drift run did not publish a failed status. Status: {status_doc[:300]}"
+    handoff_ok, handoff_feedback = validate_handoff_doc(
+        handoff_doc,
+        marker,
+        expect_success=False,
+        require_reason=True,
+    )
+    if not handoff_ok:
+        return 0.0, handoff_feedback
     if not (missing_reported and extra_reported):
         return 0.0, (
             "Balanced drift was not reported as both missing and extra set drift. "
@@ -1098,15 +1311,17 @@ def check_validation_catches_integrity_drift(setup_info):
     ts = int(time.time())
     marker = f"GRADER-INT-{ts}"
     set_status_doc(marker)
+    set_handoff_doc(marker)
 
     job_name = f"grader-integrity-{ts}"
     completed, logs, failed, err = trigger_backup_job(job_name)
     status_doc = wait_for_status_change(marker)
+    handoff_doc = wait_for_handoff_change(marker)
     cleanup_job(job_name)
     ensure_consistent_dataset(setup_info)
 
     job_failed = failed.isdigit() and int(failed) > 0
-    text = record_text(logs, status_doc)
+    text = record_text(logs, status_doc, handoff_doc)
 
     if err:
         return 0.0, err
@@ -1114,6 +1329,14 @@ def check_validation_catches_integrity_drift(setup_info):
         return 0.0, f"Integrity drift did not fail closed. Logs:\n{extract_relevant_excerpt(logs, target_key)}"
     if not status_doc or marker in status_doc or not status_has_failure(status_doc):
         return 0.0, f"Integrity drift run did not publish a failed status. Status: {status_doc[:300]}"
+    handoff_ok, handoff_feedback = validate_handoff_doc(
+        handoff_doc,
+        marker,
+        expect_success=False,
+        require_reason=True,
+    )
+    if not handoff_ok:
+        return 0.0, handoff_feedback
     if not evidence_for_integrity_mismatch(text, target_key):
         return 0.0, (
             "Integrity drift run did not report corrupted mirrored content. "

@@ -751,6 +751,35 @@ data:
 
     ### Contacts
     - Platform team: #platform-eng on Mattermost
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: glitchtip-backup-restore-handoff
+  namespace: glitchtip
+  labels:
+    app: glitchtip
+    component: documentation
+data:
+  handoff.json: |
+    {
+      "latest_run": "2026-03-30T02:00:14Z",
+      "backup_id": "glitchtip-20260330_020014",
+      "result": "success",
+      "safe_for_restore": true,
+      "pg_dump": {
+        "status": "success",
+        "bytes": 472115
+      },
+      "attachments": {
+        "verified_objects": 25,
+        "validation_mode": "count-comparison"
+      },
+      "notes": [
+        "This restore handoff record is stale until the current pipeline refreshes it.",
+        "Downstream recovery tooling checks this object before automated drill handoff."
+      ]
+    }
 EOF
 
 ###############################################
@@ -761,6 +790,7 @@ kubectl annotate configmap/glitchtip-backup-script-original -n glitchtip kubectl
 kubectl annotate configmap/glitchtip-backup-runtime-original -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate configmap/glitchtip-dr-incident-2024q3 -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate configmap/glitchtip-backup-status -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
+kubectl annotate configmap/glitchtip-backup-restore-handoff -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate cronjob/glitchtip-backup -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate cronjob/glitchtip-backup-retention-manager -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
 kubectl annotate cronjob/glitchtip-backup-template-manager -n glitchtip kubectl.kubernetes.io/last-applied-configuration- 2>/dev/null || true
