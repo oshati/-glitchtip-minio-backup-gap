@@ -212,7 +212,7 @@ seed_blob_and_metadata() {
   local size checksum
 
   size=$(printf "%s" "${content}" | wc -c | tr -d '[:space:]')
-  checksum=$(printf "%s" "${content}" | sha256sum | awk '{print $1}')
+  checksum=$(printf "%s" "${content}" | sha1sum | awk '{print $1}')
 
   kubectl exec -n glitchtip "${MINIO_POD}" -- sh -c "
     printf '%s' '${content}' | mc pipe local/${MINIO_BUCKET}/${blob_path} >/dev/null 2>&1

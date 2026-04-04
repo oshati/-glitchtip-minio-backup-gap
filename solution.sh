@@ -155,7 +155,7 @@ while IFS=$'\t' read -r blob expected_size expected_checksum; do
   fi
 
   actual_size=$(wc -c < "${object_path}" | tr -d '[:space:]')
-  actual_checksum=$(sha256sum "${object_path}" | awk '{print $1}')
+  actual_checksum=$(sha1sum "${object_path}" | awk '{print $1}')
   if [ "${actual_size}" != "${expected_size}" ] || [ "${actual_checksum}" != "${expected_checksum}" ]; then
     echo "${blob} checksum mismatch expected=${expected_checksum} actual=${actual_checksum} size_expected=${expected_size} size_actual=${actual_size}" >> "${BACKUP_DIR}/integrity-mismatches.txt"
   fi

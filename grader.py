@@ -67,8 +67,8 @@ def load_setup_info():
     return info
 
 
-def sha256_text(value):
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+def content_digest(value):
+    return hashlib.sha1(value.encode("utf-8")).hexdigest()
 
 
 def byte_count(value):
@@ -224,7 +224,7 @@ def minio_put_object_content(minio_pod, bucket, object_key, content, setup_info)
 
 
 def ensure_fileblob_row(pg_pod, blob_path, content, setup_info):
-    checksum = sha256_text(content)
+    checksum = content_digest(content)
     size = byte_count(content)
     blob_sql = sql_escape(blob_path)
     checksum_sql = sql_escape(checksum)
@@ -401,7 +401,7 @@ def verify_live_incident_untouched(setup_info):
             return 0
 
     if live_missing:
-        expected_missing_summary = f"{sha256_text(live_missing_content)}|{byte_count(live_missing_content)}"
+        expected_missing_summary = f"{content_digest(live_missing_content)}|{byte_count(live_missing_content)}"
         if row_summary(live_missing) != expected_missing_summary:
             return False, (
                 "The live incident was altered: the database metadata for the known missing object "
@@ -432,7 +432,7 @@ def verify_live_incident_untouched(setup_info):
             )
 
     if integrity_target:
-        expected_integrity_summary = f"{sha256_text(integrity_target_content)}|{byte_count(integrity_target_content)}"
+        expected_integrity_summary = f"{content_digest(integrity_target_content)}|{byte_count(integrity_target_content)}"
         if row_summary(integrity_target) != expected_integrity_summary:
             return False, (
                 "The live incident was altered: the database metadata for the known integrity-check "
