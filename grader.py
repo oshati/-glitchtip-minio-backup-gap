@@ -420,7 +420,14 @@ def handoff_has_validation_details(text):
     return any(re.search(pattern, lowered) for pattern in patterns)
 
 
-def validate_handoff_doc(handoff_doc, marker, expect_success, require_artifact_details=False, require_reason=False):
+def validate_handoff_doc(
+    handoff_doc,
+    marker,
+    expect_success,
+    require_artifact_details=False,
+    require_validation_summary=False,
+    require_failure_details=False,
+):
     if not handoff_doc or marker in handoff_doc:
         return False, "Backup run did not update the machine-readable restore handoff surface"
     if not handoff_is_machine_readable(handoff_doc):
@@ -439,9 +446,14 @@ def validate_handoff_doc(handoff_doc, marker, expect_success, require_artifact_d
             return False, f"Restore handoff does not report non-zero dump artifact evidence. Handoff: {handoff_doc[:300]}"
         if handoff_object_count(handoff_doc) is None:
             return False, f"Restore handoff does not report a non-zero attachment capture count. Handoff: {handoff_doc[:300]}"
-    if require_reason and not handoff_has_validation_details(handoff_doc):
+    if require_validation_summary and not handoff_has_validation_details(handoff_doc):
         return False, (
-            "Restore handoff does not explain why the latest run is blocked or how validation was evaluated. "
+            "Restore handoff does not describe what verification backed the latest successful run. "
+            f"Handoff: {handoff_doc[:300]}"
+        )
+    if require_failure_details and not handoff_has_validation_details(handoff_doc):
+        return False, (
+            "Restore handoff does not carry machine-readable mismatch detail for the blocked run. "
             f"Handoff: {handoff_doc[:300]}"
         )
     return True, ""
@@ -982,7 +994,7 @@ def check_clean_run_proves_real_backup_artifacts(setup_info):
         marker,
         expect_success=True,
         require_artifact_details=True,
-        require_reason=True,
+        require_validation_summary=True,
     )
     if not handoff_ok:
         return 0.0, handoff_feedback
@@ -1059,7 +1071,7 @@ def check_pipeline_handles_clean_and_drift_runs(setup_info):
         clean_marker,
         expect_success=True,
         require_artifact_details=True,
-        require_reason=True,
+        require_validation_summary=True,
     )
     if not handoff_ok:
         return 0.0, handoff_feedback
@@ -1100,7 +1112,7 @@ def check_pipeline_handles_clean_and_drift_runs(setup_info):
         drift_handoff,
         drift_marker,
         expect_success=False,
-        require_reason=True,
+        require_failure_details=True,
     )
     if not handoff_ok:
         return 0.0, handoff_feedback
@@ -1170,7 +1182,7 @@ def check_validation_catches_forward_gap(setup_info):
         handoff_doc,
         marker,
         expect_success=False,
-        require_reason=True,
+        require_failure_details=True,
     )
     if not handoff_ok:
         return 0.0, handoff_feedback
@@ -1228,7 +1240,7 @@ def check_validation_catches_reverse_gap(setup_info):
         handoff_doc,
         marker,
         expect_success=False,
-        require_reason=True,
+        require_failure_details=True,
     )
     if not handoff_ok:
         return 0.0, handoff_feedback
@@ -1298,7 +1310,7 @@ def check_validation_catches_balanced_set_drift(setup_info):
         handoff_doc,
         marker,
         expect_success=False,
-        require_reason=True,
+        require_failure_details=True,
     )
     if not handoff_ok:
         return 0.0, handoff_feedback
@@ -1362,7 +1374,7 @@ def check_validation_catches_integrity_drift(setup_info):
         handoff_doc,
         marker,
         expect_success=False,
-        require_reason=True,
+        require_failure_details=True,
     )
     if not handoff_ok:
         return 0.0, handoff_feedback

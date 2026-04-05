@@ -28,6 +28,11 @@ prompt: |
   sure successful runs refresh it with current backup details and failed runs
   mark restore handoff as unsafe or blocked instead of leaving old success data
   behind.
+  Because downstream recovery tooling reads that handoff without opening pod
+  logs, a successful handoff should also say what kind of verification backed
+  the run, and a blocked handoff should carry machine-readable mismatch detail
+  or counts that explain why restore is unsafe. Any clear machine-readable
+  format is fine.
 
   A few attempted repairs have looked healthy for a run or two and then quietly
   drifted back after the surrounding job-management automation reconciled them,
