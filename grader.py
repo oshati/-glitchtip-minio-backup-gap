@@ -365,16 +365,45 @@ def handoff_has_run_identity(text):
     ))
 
 
+def parse_handoff_json(text):
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def handoff_dump_bytes(text):
+    parsed = parse_handoff_json(text)
+    if parsed:
+        pg_dump = parsed.get("pg_dump")
+        if isinstance(pg_dump, dict):
+            try:
+                bytes_value = int(pg_dump.get("bytes", 0))
+            except (TypeError, ValueError):
+                bytes_value = 0
+            if bytes_value > 0:
+                return bytes_value
     return first_positive_int(text.lower(), [
-        r"(?:pg_dump|dump_bytes|dump size|dump_size|postgresql dump|database dump)[^0-9\n]{0,60}(\d+)",
+        r"(?:pg_dump|dump_bytes|dump size|dump_size|postgresql dump|database dump)[\s\S]{0,120}?(\d+)",
     ])
 
 
 def handoff_object_count(text):
+    parsed = parse_handoff_json(text)
+    if parsed:
+        attachments = parsed.get("attachments")
+        if isinstance(attachments, dict):
+            for key in ("mirrored_objects", "verified_objects", "captured_objects", "attachment_objects"):
+                try:
+                    count = int(attachments.get(key, 0))
+                except (TypeError, ValueError):
+                    count = 0
+                if count > 0:
+                    return count
     return first_positive_int(text.lower(), [
         r"(?:attachments?|objects?|minio objects?|bucket objects?|captured_objects|verified_objects|mirrored_objects)"
-        r"[^0-9\n]{0,60}(\d+)",
+        r"[\s\S]{0,120}?(\d+)",
     ])
 
 
