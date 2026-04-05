@@ -296,7 +296,17 @@ def status_has_success(text):
 
 def status_has_failure(text):
     lowered = text.lower()
-    return any(token in lowered for token in ["status:** failed", "status: failed", "status=failed", "failed", "error"])
+    return any(token in lowered for token in [
+        "status:** failed",
+        "status: failed",
+        "status=failed",
+        "status:** blocked",
+        "status: blocked",
+        "status=blocked",
+        "failed",
+        "blocked",
+        "error",
+    ])
 
 
 def first_positive_int(text, patterns):
@@ -409,13 +419,160 @@ def handoff_object_count(text):
 
 def handoff_has_validation_details(text):
     lowered = text.lower()
+    parsed = parse_handoff_json(text)
+    if parsed:
+        verification = parsed.get("verification")
+        attachments = parsed.get("attachments")
+        mismatch = parsed.get("mismatch")
+        mismatch_detail = parsed.get("mismatch_detail")
+
+        if isinstance(verification, dict):
+            verification_strings = [
+                str(verification.get(key, ""))
+                for key in (
+                    "mode",
+                    "type",
+                    "description",
+                    "validation_mode",
+                    "verification_mode",
+                    "verification_description",
+                    "source_of_truth",
+                    "checked_against",
+                    "compared_against",
+                )
+            ]
+            verification_blob = " ".join(verification_strings).lower()
+            if any(token in verification_blob for token in [
+                "validation",
+                "verify",
+                "verified",
+                "checksum",
+                "sha1",
+                "sha-1",
+                "sha256",
+                "sha-256",
+                "path",
+                "set",
+                "membership",
+                "integrity",
+                "cross-check",
+                "cross reference",
+                "cross-reference",
+                "match",
+            ]):
+                return True
+
+            for key in (
+                "missing_in_storage",
+                "missing_from_storage",
+                "missing_in_object_storage",
+                "extra_in_storage",
+                "extra_in_object_storage",
+                "orphan_in_storage",
+                "orphaned_in_storage",
+                "checksum_mismatch",
+                "checksum_mismatches",
+                "integrity_mismatch",
+                "integrity_mismatches",
+            ):
+                try:
+                    if int(verification.get(key, 0)) >= 0:
+                        return True
+                except (TypeError, ValueError):
+                    pass
+
+        if isinstance(attachments, dict):
+            attachment_strings = [
+                str(attachments.get(key, ""))
+                for key in (
+                    "validation_mode",
+                    "verification_mode",
+                    "status",
+                )
+            ]
+            attachment_blob = " ".join(attachment_strings).lower()
+            if any(token in attachment_blob for token in [
+                "validation",
+                "verify",
+                "verified",
+                "checksum",
+                "sha1",
+                "sha-1",
+                "path",
+                "set",
+                "membership",
+                "integrity",
+                "cross-check",
+                "cross reference",
+                "cross-reference",
+            ]):
+                return True
+
+            for key in (
+                "missing_in_storage",
+                "missing_from_storage",
+                "missing_in_bucket",
+                "missing_in_object_storage",
+                "extra_in_storage",
+                "extra_in_bucket",
+                "extra_in_object_storage",
+                "orphan_in_storage",
+                "orphaned_in_storage",
+                "orphaned_in_bucket",
+                "checksum_mismatch",
+                "checksum_mismatches",
+                "integrity_mismatches",
+            ):
+                try:
+                    if int(attachments.get(key, 0)) >= 0:
+                        return True
+                except (TypeError, ValueError):
+                    pass
+
+            mismatch_counts = attachments.get("mismatch_counts")
+            if isinstance(mismatch_counts, dict):
+                for key in (
+                    "missing_in_storage",
+                    "missing_from_storage",
+                    "missing_in_bucket",
+                    "extra_in_storage",
+                    "extra_in_bucket",
+                    "orphan_in_storage",
+                    "orphaned_in_storage",
+                    "orphaned_in_bucket",
+                    "checksum_mismatch",
+                    "checksum_mismatches",
+                ):
+                    try:
+                        if int(mismatch_counts.get(key, 0)) >= 0:
+                            return True
+                    except (TypeError, ValueError):
+                        pass
+
+        if isinstance(mismatch, dict) or isinstance(mismatch_detail, dict):
+            return True
+
+        for key in ("reason", "blocked_reason", "summary", "detail"):
+            value = parsed.get(key)
+            if isinstance(value, str) and value.strip():
+                return True
+
     patterns = [
         r"validation(?:_mode)?[\"'\s:=]+(?:exact|set|integrity|verified|matched)",
+        r"validation(?:_mode)?[\"'\s:=]+(?:per[-_ ]object|per[-_ ]blob|sha1|sha-1|checksum|path|membership|cross)",
+        r"verification(?:_mode|\.mode)?[\"'\s:=]+(?:per[-_ ]object|per[-_ ]blob|sha1|sha-1|checksum|path|membership|cross)",
+        r"verification(?:_description|\.description)?[\"'\s:=]+.+",
         r"missing(?:_in_object_storage)?[\"'\s:=]+\d+",
+        r"missing(?:_from_storage|_in_storage|_in_bucket)?[\"'\s:=]+\d+",
         r"extra(?:_in_object_storage)?[\"'\s:=]+\d+",
+        r"extra(?:_in_storage|_in_bucket)?[\"'\s:=]+\d+",
+        r"orphan(?:ed)?(?:_in_storage|_in_bucket)?[\"'\s:=]+\d+",
         r"integrity(?:_mismatches?)?[\"'\s:=]+\d+",
+        r"checksum(?:_mismatch(?:es)?)?[\"'\s:=]+\d+",
         r"reason[\"'\s:=]+.+",
         r"blocked_reason[\"'\s:=]+.+",
+        r"summary[\"'\s:=]+.+",
+        r"detail[\"'\s:=]+.+",
     ]
     return any(re.search(pattern, lowered) for pattern in patterns)
 
@@ -722,10 +879,15 @@ def evidence_for_forward_gap(text, expected_path):
         r"(?:db|database).*(?:blob|file|path|record).*(?:missing|not found)",
         r"database references.*missing",
         r"missing_in_object_storage",
+        r"missing_in_storage",
+        r"missing_from_storage",
+        r"missing_in_bucket",
         r"lost on restore",
         r"path mismatch",
         r"missing:",
         r"missing files?",
+        r"missing objects?",
+        r"db[-_ ]referenced.*missing",
     ]
 
     return has_path_with_context_patterns(text, expected_path, forward_patterns)
@@ -742,6 +904,11 @@ def evidence_for_reverse_gap(text, expected_path):
         r"(?:files?|objects?) in (?:mirror|backup|object storage) but not in (?:db|database)",
         r"(?:files?|objects?) in (?:mirror|backup|object storage) have no matching",
         r"extra_in_object_storage",
+        r"extra_in_storage",
+        r"extra_in_bucket",
+        r"orphan_in_storage",
+        r"orphaned_in_storage",
+        r"orphaned_in_bucket",
         r"leftover",
         r"unexpected (?:object|objects|file|files)",
     ]
