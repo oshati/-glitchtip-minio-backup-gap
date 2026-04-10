@@ -1,9 +1,10 @@
-id: null
+id: glitchtip-minio-backup-gap
 prompt: |
-  The platform team reran a quarterly restore drill for GlitchTip, and the
-  result was uncomfortable: the backup path has been reporting healthy for a
-  while, but the restored data did not line up with what people expected to
-  see in the app.
+  [Context]
+  The platform team reran a quarterly restore drill, and the result was
+  uncomfortable: the backup path has been reporting healthy for a while, but
+  the restored data did not line up with what people expected to see in the
+  app.
 
   This is not a brand-new backup pipeline. Someone has already worked on it,
   and at a quick glance it can look fine. The problem is that a "green" run is
@@ -16,23 +17,25 @@ prompt: |
   looked normal even though the recovered contents were still wrong. Some of the
   bad restores had the right object names but the wrong bytes behind them.
 
+  [TASK]
   Investigate the existing backup flow in the `glitchtip` namespace and make it
-  trustworthy again. A healthy run should still complete. A bad run should stop
-  itself instead of quietly producing a misleading result. There is already a
-  run-status note somewhere in the cluster, but it is stale enough that on-call
-  cannot trust it right now. Make the latest run state obvious there without
-  requiring someone to read pod logs.
+  trustworthy again.
+
+  A healthy run should still complete. A bad run should stop itself instead of
+  quietly producing a misleading result. There is already a run-status note
+  somewhere in the cluster, but it is stale enough that on-call cannot trust it
+  right now. Make the latest run state obvious there without requiring someone
+  to read pod logs.
 
   There is also a stale machine-readable restore handoff record somewhere in
   the cluster that downstream recovery tooling consults before a drill. Make
   sure successful runs refresh it with current backup details and failed runs
   mark restore handoff as unsafe or blocked instead of leaving old success data
-  behind.
-  Because downstream recovery tooling reads that handoff without opening pod
-  logs, a successful handoff should also say what kind of verification backed
-  the run, and a blocked handoff should carry machine-readable mismatch detail
-  or counts that explain why restore is unsafe. Any clear machine-readable
-  format is fine.
+  behind. Because downstream recovery tooling reads that handoff without opening
+  pod logs, a successful handoff should also say what kind of verification
+  backed the run, and a blocked handoff should carry machine-readable mismatch
+  detail or counts that explain why restore is unsafe. Any clear
+  machine-readable format is fine.
 
   A few attempted repairs have looked healthy for a run or two and then quietly
   drifted back after the surrounding job-management automation reconciled them,
@@ -51,22 +54,11 @@ prompt: |
   only needs enough runtime access to publish its run note and restore handoff;
   it should not end up with broad maintenance access that can rewrite its own
   backup configuration.
+
   Do not rewrite the current attachment bucket or database rows just to make the
   drill pass; the point is to make the backup path tell the truth about the
   state it sees today, not to clean up that state by hand.
 
 metadata:
   category: platform-eng
-  spec_id: 9e4d158e-96ff-4435-ab39-4d1e389f4b47
   difficulty: hard
-  domains:
-    - glitchtip
-    - error-tracking
-    - minio
-    - backup-recovery
-  components:
-    - GlitchTip
-    - PostgreSQL
-    - MinIO
-    - Kubernetes
-    - CronJob
